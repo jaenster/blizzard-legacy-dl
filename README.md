@@ -101,6 +101,23 @@ whichever files it spans — pieces straddle file boundaries constantly — so a
 and order-independent. `verify` re-reads and re-hashes, so it also checks a copy obtained some
 other way against Blizzard's own piece hashes.
 
+## Finding what else is up there
+
+`scripts/probe-applications.sh` enumerates the `/applications/` tree by asking for piece `0` of
+each candidate - a payload existing and its piece 0 existing are the same question, and a range
+request makes it free. It self-tests against the five known-good bases first and refuses to keep
+going if they do not answer, because that means you are on a blocked network and every later 403
+would be meaningless.
+
+Confirmed live, from the stubs' own torrents:
+
+    Diablo2/1.14B/{D2,LOD}/<locale>
+    StarCraft/1.15.2/Combo/<locale>      (enUS is served as enUS-2)
+    Warcraft3/1.27a2/{ROC,TFT}/<locale>
+
+45 payloads, 40.5 GB in total. The Wayback Machine has nothing indexed under this host, so
+probing from a machine with access is the only way to map it.
+
 ## Library
 
 ```zig
