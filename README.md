@@ -68,19 +68,25 @@ the base URL or any path out of `info.files` gets you nowhere. Every piece is it
 its own SHA-1 in `info.pieces`, so they can be pulled in any order and in parallel. It is also why
 the real client's progress bar fills in scattered blocks instead of left to right.
 
-The exact request, from `Blizzard Downloader 2.2.0.1285`:
+The exact request, captured off the wire from `Blizzard Downloader 2.2.0.1285` rather than read
+out of the disassembly:
 
 ```
-GET /applications/Diablo2/1.14B/LOD/enUS/0 HTTP/1.1
-User-Agent: Blizzard Web Client
+GET /applications/Diablo2/1.14B/D2/enUS/0 HTTP/1.1
 Host: rogue.blizzard.com.edgesuite.net
-Pragma: no-cache
+User-Agent: Blizzard Web Client
+Accept: */*
 Connection: Keep-Alive
 ```
 
-No Accept, no Referer, no Range, no token or cookie. Retries append `?<random letters>` to miss
-the CDN cache. `Range:` shows up only when the metainfo sets `chunk length` bigger than
-`piece length`, which none of these do.
+No Referer, no Range, no token or cookie. (Watched through a proxy the last header arrives as
+`Proxy-Connection`, which is WinInet's doing, not the program's.) Retries append
+`?<random letters>` to miss the CDN cache. `Range:` shows up only when the metainfo sets
+`chunk length` bigger than `piece length`, which none of these do.
+
+Before any of that the downloader fetches `http://12.129.222.52/update/Downloader.ini`, a
+hardcoded address that no longer answers. Nothing recovers from it — the program simply waits out
+the connect timeout, which is most of the pause on startup.
 
 Two details cost me an afternoon, so they are worth writing down. Pieces go through WinInet
 (`HttpDirect_RequestPiece` calls `HttpWinInet_SendRequest`), not the socket code in
@@ -90,11 +96,38 @@ and says `Blizzard Downloader 2.2`, while pieces come from
 
 ## The catch
 
-`rogue.blizzard.com.edgesuite.net` sits behind an Akamai rule that keys on the client, not the
-request. From a machine where Blizzard's own downloader works, this tool works. From anywhere
-else every path returns 403, including `/`, while a sibling property like
-`dist.blizzard.com.edgesuite.net` gives a normal 404 for a missing path. No header changes that,
-and this tool cannot invent access it does not have.
+`rogue.blizzard.com.edgesuite.net` returns 403 for every path, `/` and `/robots.txt` included.
+It is not this tool sending the wrong thing, and it is not one blocked network:
+
+- Blizzard's own `Downloader_Diablo2_enUS.exe`, run under wine behind a logging proxy, sends
+  byte for byte what this tool sends — and gets the same 403. That is what `proxy` below is for;
+  the comparison is a two-minute job, not a matter of opinion.
+- Akamai tells the two cases apart. A hostname it has no configuration for answers
+  `400, Reference #9`. This one answers `403, Reference #18`: a live property with a deny rule.
+- It is not the caller's reputation either. `dist.blizzard.com`, `blzddist1-a.akamaihd.net` and
+  the regional CDN names all answer the same machine with an ordinary 404.
+- Denied from Dutch consumer broadband and from a German datacentre, over HTTP and HTTPS, on six
+  edge addresses, and on Akamai's staging network.
+
+All 44 Windows stubs — every product, every locale — point at that one host, so there is no
+second base to fall back to. The piece protocol itself is understood and implemented; what is
+missing is a host willing to serve it. `--base` points `fetch` at any mirror laid out the same
+way, and `verify` checks whatever comes back against Blizzard's own piece hashes.
+
+## Watching the real downloader
+
+`proxy` stands a logging HTTP proxy in front of it. WinInet honours the proxy in Internet
+Settings, so every request appears in full — including the headers WinInet adds that reading the
+disassembly will never show you — and is forwarded on, so the download keeps working while it is
+watched.
+
+```
+blizzard-legacy-dl proxy            # listens on :8888
+```
+
+Then, on the machine running the downloader, Internet Options -> Connections -> LAN settings ->
+proxy, pointed at whatever host is running it. No administrator rights and no hosts file. HTTPS
+is tunnelled through CONNECT and stays unreadable, which is fine — none of this is HTTPS.
 
 ## Commands
 
@@ -104,8 +137,9 @@ stubs   -o <dir>                   download every product/locale/os stub there i
 files   <stub>                     the payload's file list
 plan    <stub> [n]                 piece count, URL for piece n, files it spans
 fetch   <stub> [-o dir]            fetch every piece, verify it, assemble
-        [--from n] [--to n] [--retries n]
+        [--from n] [--to n] [--retries n] [--base url]
 verify  <stub> [-o dir]            re-check an assembled payload piece by piece
+proxy   [--port n]                 watch what the real downloader sends, verbatim
 ```
 
 `<stub>` is a product code (`D2XP`), a downloader `.exe`, a Mac `.zip`, or a plain `.torrent`.

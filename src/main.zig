@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const legacy = @import("legacy");
+const proxy = @import("proxy.zig");
 
 const usage =
     \\blizzard-legacy-dl — read a Blizzard legacy downloader stub and fetch its payload
@@ -15,12 +16,13 @@ const usage =
     \\  plan    <stub.exe> [n]             piece count, and the URL for piece n
     \\  fetch   <stub> [-o dir] [opts]     fetch, verify and assemble the payload
     \\  verify  <stub> [-o dir]            re-verify an assembled payload
-    \\  sniff   [--port n]                 log what the real downloader sends, verbatim
+    \\  proxy   [--port n]                 watch what the real downloader sends, verbatim
     \\
     \\fetch options:
     \\  --from <n>   first piece (default 0)
     \\  --to <n>     last piece, inclusive (default: the last one)
     \\  --retries <n>  per-piece retries before giving up (default 3)
+    \\  --base <url> fetch pieces from a mirror instead of the (dead) Blizzard host
     \\
     \\<stub> is a downloader .exe, a Mac .app binary, a .torrent — or just a product code,
     \\which is fetched from Blizzard on the spot:
@@ -133,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
     var from: usize = 0;
     var to: ?usize = null;
     var retries: usize = 3;
+    var base: ?[]const u8 = null;
     var i: usize = 3;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -148,6 +151,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--retries") and i + 1 < argv.len) {
             i += 1;
             retries = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--base") and i + 1 < argv.len) {
+            i += 1;
+            base = argv[i];
         } else if (std.mem.eql(u8, a, "--locale") and i + 1 < argv.len) {
             i += 1;
             locale = argv[i];
@@ -160,16 +166,12 @@ pub fn main(init: std.process.Init) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = init.io };
     defer client.deinit();
 
-    // Point the CDN hostname at this machine and start the real downloader, and every request
-    // it makes lands here byte for byte. That is the only way to settle what it sends that we
-    // do not, when the CDN answers it and refuses us.
-    //
-    //   Windows, as Administrator:
-    //     echo 127.0.0.1 rogue.blizzard.com.edgesuite.net >> %WINDIR%\System32\drivers\etc\hosts
-    //     blizzard-legacy-dl sniff
-    //   then run the downloader. Undo the hosts line afterwards.
-    if (std.mem.eql(u8, verb, "sniff")) {
-        var port: u16 = 80;
+    // What the real downloader puts on the wire, captured rather than guessed at. It goes
+    // through WinInet, and WinInet honours the Internet Settings proxy, so standing a proxy in
+    // front of it shows the request in full — including the headers WinInet adds that no amount
+    // of reading the disassembly would reveal. See src/proxy.zig.
+    if (std.mem.eql(u8, verb, "proxy")) {
+        var port: u16 = 8888;
         var k: usize = 2;
         while (k < argv.len) : (k += 1) {
             if (std.mem.eql(u8, argv[k], "--port") and k + 1 < argv.len) {
@@ -177,34 +179,7 @@ pub fn main(init: std.process.Init) !void {
                 port = try std.fmt.parseInt(u16, argv[k], 10);
             }
         }
-        const fd = socket(2, 1, 0); // AF_INET, SOCK_STREAM
-        if (fd < 0) return error.SocketFailed;
-        var one: c_int = 1;
-        _ = setsockopt(fd, 0xffff, 0x0004, @ptrCast(&one), 4); // SOL_SOCKET, SO_REUSEADDR
-        var sa = std.mem.zeroes([16]u8);
-        sa[0] = 16;
-        sa[1] = 2; // AF_INET
-        sa[2] = @intCast(port >> 8);
-        sa[3] = @intCast(port & 0xff);
-        if (bind(fd, &sa, 16) != 0) {
-            std.debug.print("cannot bind port {d} — on Windows and Linux port 80 needs admin/root\n", .{port});
-            return error.BindFailed;
-        }
-        if (listen(fd, 16) != 0) return error.ListenFailed;
-        std.debug.print("listening on :{d}. Point rogue.blizzard.com.edgesuite.net at this host,\n" ++
-            "then start the downloader. Ctrl-C when you have a request.\n\n", .{port});
-        var buf: [8192]u8 = undefined;
-        while (true) {
-            const c = accept(fd, null, null);
-            if (c < 0) continue;
-            const n = read(c, &buf, buf.len);
-            if (n > 0) {
-                std.debug.print("─── request ───\n{s}\n", .{buf[0..@intCast(n)]});
-                const reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                _ = write(c, reply.ptr, reply.len);
-            }
-            _ = close(c);
-        }
+        return proxy.run(port);
     }
 
     // `stubs` needs no stub of its own, so it runs before we go looking for one.
@@ -232,7 +207,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const stub = try resolveStub(gpa, &client, argv[2], locale, os_);
-    const meta = try legacy.fromStub(gpa, stub);
+    var meta = try legacy.fromStub(gpa, stub);
+
+    // The pieces are numbered files under one base, so any host laid out the same way serves
+    // them — which matters, because Blizzard's own no longer does. See README.
+    if (base) |b| meta.direct_download = std.mem.trimEnd(u8, b, "/");
 
     var b1: [32]u8 = undefined;
     if (std.mem.eql(u8, verb, "info")) {
