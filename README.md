@@ -1,69 +1,56 @@
 # blizzard-legacy-dl
 
-Read a **Blizzard legacy downloader** stub and fetch what it points at, without running it.
+Reads a Blizzard legacy downloader stub and fetches what it points at, without running it.
 
 ```
 zig build
-./zig-out/bin/blizzard-legacy-dl info  Downloader_Diablo2_enUS.exe
-./zig-out/bin/blizzard-legacy-dl fetch Downloader_Diablo2_enUS.exe -o ./out
+zig-out/bin/blizzard-legacy-dl info  Downloader_Diablo2_enUS.exe
+zig-out/bin/blizzard-legacy-dl fetch Downloader_Diablo2_enUS.exe -o ./out
 ```
 
-## Where the stubs come from
+## Getting a stub
 
-Blizzard still serves them, publicly and unauthenticated:
+Blizzard still serves them, no account needed:
 
 ```
-https://www.battle.net/download/getLegacy?product=<CODE>&locale=<LOCALE>&os=<WIN|MAC>
+https://downloader.battle.net/download/getLegacy?product=D2DV&locale=en-US&os=WIN
 ```
 
-`product` is one of **`D2DV D2XP STAR WAR3 W3XP`** — every other Battle.net product code
-(`DRTL`, `W2BN`, `DSHR`, `SSHR`, `D2ST`, `DIAB`, `W3DM`, ...) returns 400. `os` is `WIN` or `MAC`
-and nothing else; there is no PowerPC or console axis. `locale` varies per product — D2DV answers
-for `en-US en-GB de-DE es-ES fr-FR it-IT ko-KR pl-PL zh-TW`.
+Only five products answer: `D2DV D2XP STAR WAR3 W3XP`. Everything else (`DRTL`, `W2BN`, `DSHR`,
+`D2ST`, `W3DM`, `WOW`, `D3`, ...) gives a 400. `os` is `WIN` or `MAC`, nothing else. Locales vary
+per product; D2DV has `en-US en-GB de-DE es-ES fr-FR it-IT ko-KR pl-PL zh-TW`.
 
-That is **85 combinations, and all 85 are distinct binaries** — the locale is baked in, not a flag.
+That works out to 85 stubs, all different files, because the locale is compiled in.
 
-## What the stub actually is
+The endpoint rate-limits. Sleep between requests or you get empty replies that look like 404s.
 
-A BitTorrent client with the torrent **bencoded inside the executable**. Alongside the usual
-`info` dictionary it carries Blizzard's own keys:
+## How the download works
 
-| key | meaning |
-|-|-|
-| `announce` | `http://<region>.tracker.worldofwarcraft.com:3724/announce` |
-| `direct download` | the HTTP piece source — **this is the one that still works** |
-| `launch target` / `mac launch target` | what to run after assembly |
-| `locale`, `use pieces` | |
+The stub is a BitTorrent client, and its torrent is bencoded inside the executable. On Mac it is
+a separate `downloader.torrent` in the app bundle. Either way this tool finds it.
 
-The trackers have been dead for years: all five regions still resolve in DNS to real Blizzard
-addresses, and port 3724 is closed on every one. The downloader says so on screen — *"The tracker
-is not responding"* — and downloads anyway, because the HTTP source is plugged into the same piece
-machinery as a peer. It even appears in the peer list, with its URL where a peer id would go.
+Besides the usual `info` dictionary there are Blizzard's own keys: `announce`, `direct download`,
+`launch target`, `mac launch target`, `locale`, `use pieces`.
 
-## The bit that is not obvious
+The trackers are gone. All five regions still have DNS pointing at Blizzard addresses but port
+3724 is closed everywhere, and the client tells you so ("The tracker is not responding") while
+downloading fine anyway. It falls back to the `direct download` URL, which it treats as just
+another peer, URL where the peer id would go.
 
-**The HTTP source serves one numbered file per piece.** Not the payload's files, and not one
-ranged stream:
+That HTTP source serves one numbered file per piece:
 
 ```
 <direct download>/0
 <direct download>/1
 ...
-<direct download>/2038
 ```
 
-Which is why `curl`-ing the base URL, or any path from `info.files`, gets you nowhere. Each piece
-is an independent object, independently verifiable against its SHA-1 in `info.pieces`, so they can
-be fetched in **any order and in parallel** — that is why the real client's progress bar fills in
-scattered blocks rather than left to right.
+Not the payload's files, and not one big file you range-request. This is the whole reason curling
+the base URL or any path out of `info.files` gets you nowhere. Every piece is its own object with
+its own SHA-1 in `info.pieces`, so they can be pulled in any order and in parallel. It is also why
+the real client's progress bar fills in scattered blocks instead of left to right.
 
-Established by reverse engineering `Blizzard Downloader 2.2.0.1285`
-(pdb `…/tools-sc2-gm/downloader/release/Blizzard Downloader.pdb`, RSDS
-`36D5DD12-AFE8-415F-9CF4-D109BE7FC832`):
-`HttpDirect_RequestPiece` → `HttpWinInet_SendRequest`, which goes through **WinInet**, not the
-`Http-get.cpp` socket path. The two send different agents, and that trips people up: the socket
-path is the *tracker's* and says `Blizzard Downloader 2.2`, while the piece path comes from
-`InternetOpenA("Blizzard Web Client", ...)`. The request is:
+The exact request, from `Blizzard Downloader 2.2.0.1285`:
 
 ```
 GET /applications/Diablo2/1.14B/LOD/enUS/0 HTTP/1.1
@@ -73,50 +60,56 @@ Pragma: no-cache
 Connection: Keep-Alive
 ```
 
-No Accept, no Referer, no Range, no token, no cookie, no session. A retry appends
-`?<shuffled alphabet>` purely to miss the CDN cache. `Range:` appears only when the metainfo has a
-`chunk length` larger than `piece length`, which none of these do.
+No Accept, no Referer, no Range, no token or cookie. Retries append `?<random letters>` to miss
+the CDN cache. `Range:` shows up only when the metainfo sets `chunk length` bigger than
+`piece length`, which none of these do.
 
-## A caveat worth stating plainly
+Two details cost me an afternoon, so they are worth writing down. Pieces go through WinInet
+(`HttpDirect_RequestPiece` calls `HttpWinInet_SendRequest`), not the socket code in
+`Http-get.cpp`. And those two paths send different user agents: the socket one is the tracker's
+and says `Blizzard Downloader 2.2`, while pieces come from
+`InternetOpenA("Blizzard Web Client", ...)`. Copy the wrong one and nothing works.
 
-The `rogue.blizzard.com.edgesuite.net` property is behind an **Akamai access rule keyed on the
-client**, not on the request. From a machine Blizzard's downloader works on, the requests above
-work. From elsewhere every path returns `403 AkamaiGHost` — including `/` — while a sibling
-property like `dist.blizzard.com.edgesuite.net` returns a normal 404 for a missing path. Nothing
-you put in the request changes that; this tool cannot conjure access it does not have.
+## The catch
+
+`rogue.blizzard.com.edgesuite.net` sits behind an Akamai rule that keys on the client, not the
+request. From a machine where Blizzard's own downloader works, this tool works. From anywhere
+else every path returns 403, including `/`, while a sibling property like
+`dist.blizzard.com.edgesuite.net` gives a normal 404 for a missing path. No header changes that,
+and this tool cannot invent access it does not have.
 
 ## Commands
 
 ```
-info    <stub.exe>                 name, infohash, piece count, size, both URLs
-files   <stub.exe>                 the payload's file list
-plan    <stub.exe> [n]             piece count, the URL for piece n, and the files it spans
-fetch   <stub.exe> -o <dir>        fetch every piece, verify each, assemble
+info    <stub>                     name, infohash, piece count, size, both URLs
+files   <stub>                     the payload's file list
+plan    <stub> [n]                 piece count, URL for piece n, files it spans
+fetch   <stub> -o <dir>            fetch every piece, verify it, assemble
         [--from n] [--to n] [--retries n]
-verify  <stub.exe> -o <dir>        re-verify an assembled payload piece by piece
+verify  <stub> -o <dir>            re-check an assembled payload piece by piece
 ```
 
-Files are preallocated at full length up front, and each piece is written with `pwrite` into
-whichever files it spans — pieces straddle file boundaries constantly — so a `fetch` is resumable
-and order-independent. `verify` re-reads and re-hashes, so it also checks a copy obtained some
-other way against Blizzard's own piece hashes.
+`<stub>` is the downloader `.exe`, the Mac `.app`'s binary, or a plain `.torrent`.
 
-## Finding what else is up there
+Files get preallocated at full length first, then each piece is written with `pwrite` into
+whichever files it lands in. Pieces straddle file boundaries constantly, so this matters. It also
+means a fetch resumes and does not care about order.
 
-`scripts/probe-applications.sh` enumerates the `/applications/` tree by asking for piece `0` of
-each candidate - a payload existing and its piece 0 existing are the same question, and a range
-request makes it free. It self-tests against the five known-good bases first and refuses to keep
-going if they do not answer, because that means you are on a blocked network and every later 403
-would be meaningless.
+`verify` is useful on its own: it checks a copy you got some other way against Blizzard's piece
+hashes.
 
-Confirmed live, from the stubs' own torrents:
+`scripts/probe-applications.sh` maps the `/applications/` tree by asking for piece 0 of each
+candidate. It checks the five known-good bases first and stops if they 403, since on a blocked
+network every later 403 means nothing. Known live:
 
-    Diablo2/1.14B/{D2,LOD}/<locale>
-    StarCraft/1.15.2/Combo/<locale>      (enUS is served as enUS-2)
-    Warcraft3/1.27a2/{ROC,TFT}/<locale>
+```
+Diablo2/1.14B/{D2,LOD}/<locale>
+StarCraft/1.15.2/Combo/<locale>      enUS is served as enUS-2
+Warcraft3/1.27a2/{ROC,TFT}/<locale>
+```
 
-45 payloads, 40.5 GB in total. The Wayback Machine has nothing indexed under this host, so
-probing from a machine with access is the only way to map it.
+45 payloads, 40.5 GB. The Wayback Machine has nothing under this host, so probing from a machine
+with access is the only way to find more.
 
 ## Library
 
@@ -127,4 +120,4 @@ const url  = try meta.pieceUrl(gpa, 0, null);
 try meta.verify(0, piece_bytes);
 ```
 
-`zig build test` covers the bencode decoder, short final pieces, and URL construction.
+`zig build test` covers the bencode decoder, short final pieces and URL construction.
