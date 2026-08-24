@@ -3,9 +3,16 @@
 Reads a Blizzard legacy downloader stub and fetches what it points at, without running it.
 
 ```
+docker run --rm ghcr.io/jaenster/blizzard-legacy-dl info D2DV
+docker run --rm -v "$PWD:/data" ghcr.io/jaenster/blizzard-legacy-dl fetch D2DV -o /data
+```
+
+Or grab a static binary from the releases page, or build it:
+
+```
 zig build
-zig-out/bin/blizzard-legacy-dl info  D2XP
-zig-out/bin/blizzard-legacy-dl fetch D2XP -o ./out
+zig-out/bin/blizzard-legacy-dl info  D2DV
+zig-out/bin/blizzard-legacy-dl fetch D2DV -o ./out
 ```
 
 You can pass a product code and it grabs the stub from Blizzard itself. A path works too, if you

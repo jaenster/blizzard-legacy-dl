@@ -1,0 +1,91 @@
+# Tests, then a multi-arch image on ghcr, then static binaries attached to a tag.
+#
+# Zig cross-compiles, so every target builds natively on the amd64 runner - no QEMU anywhere.
+# The image is private until it is flipped once under
+# github.com/users/jaenster/packages -> blizzard-legacy-dl -> package settings -> public, after
+# which `docker run ghcr.io/jaenster/blizzard-legacy-dl info D2XP` works with no login.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test
+      - run: zig build
+      # The stub parser is the half that can be checked without network access.
+      - run: zig-out/bin/blizzard-legacy-dl 2>&1 | head -5 || true
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/blizzard-legacy-dl
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,format=long
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Cross-compile every target
+        run: |
+          set -eu
+          mkdir -p dist
+          for t in x86_64-linux-musl aarch64-linux-musl \
+                   x86_64-macos aarch64-macos \
+                   x86_64-windows aarch64-windows; do
+            zig build -Doptimize=ReleaseFast -Dtarget="$t" --prefix "build/$t"
+            ext=""; case "$t" in *windows) ext=".exe" ;; esac
+            cp "build/$t/bin/blizzard-legacy-dl$ext" "dist/blizzard-legacy-dl-$t$ext"
+          done
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

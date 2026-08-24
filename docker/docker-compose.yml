@@ -1,0 +1,9 @@
+# docker compose -f docker/docker-compose.yml run --rm dl info D2XP
+services:
+  dl:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/jaenster/blizzard-legacy-dl
+    volumes:
+      - ../out:/data
