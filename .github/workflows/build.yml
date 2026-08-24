@@ -30,8 +30,9 @@ jobs:
           version: 0.16.0
       - run: zig build test
       - run: zig build
-      # The stub parser is the half that can be checked without network access.
-      - run: zig-out/bin/blizzard-legacy-dl 2>&1 | head -5 || true
+      # Fetch, verify and assembly, end to end, against a payload built on the spot. Blizzard's
+      # host is gone, so this is the only way any of it stays covered.
+      - run: python3 scripts/roundtrip.py
 
   image:
     needs: test

@@ -48,27 +48,29 @@ const locales = [_][]const u8{
     "ja-JP", "ko-KR", "pl-PL", "pt-BR", "ru-RU", "zh-CN", "zh-TW",
 };
 
-// std.fs is reworked under 0.16's Io interface and wants an event loop; the sibling tools in
-// this stack talk to libc directly for file work, so this does too.
-extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
-extern "c" fn pread(fd: c_int, buf: [*]u8, n: usize, off: i64) isize;
-extern "c" fn pwrite(fd: c_int, buf: [*]const u8, n: usize, off: i64) isize;
-extern "c" fn ftruncate(fd: c_int, len: i64) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
-extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
-extern "c" fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const anyopaque, len: u32) c_int;
-extern "c" fn bind(fd: c_int, addr: *const [16]u8, len: u32) c_int;
-extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
-extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
-extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+// Files go through `std.Io`, which is the only file layer that exists on every target this
+// ships for — the POSIX calls this used before have no counterpart on Windows, and the payload
+// being a Windows installer makes that the one platform it would be silly not to run on.
+const File = std.Io.File;
+const Dir = std.Io.Dir;
 
-// These differ per platform (O_CREAT is 0x0200 on macOS and 0o100 on Linux), so take them from
-// std rather than hard-coding one OS's numbers.
-const O_RDONLY: c_int = @bitCast(std.posix.O{ .ACCMODE = .RDONLY });
-const O_RDWR: c_int = @bitCast(std.posix.O{ .ACCMODE = .RDWR });
-const O_RDWR_CREAT: c_int = @bitCast(std.posix.O{ .ACCMODE = .RDWR, .CREAT = true });
+/// Paths reach here both relative (`-o ./out`) and absolute, and `Dir` splits those into
+/// different calls.
+fn openFile(io: std.Io, path: []const u8, mode: Dir.OpenFileOptions.Mode) !File {
+    return if (std.fs.path.isAbsolute(path))
+        Dir.openFileAbsolute(io, path, .{ .mode = mode })
+    else
+        Dir.cwd().openFile(io, path, .{ .mode = mode });
+}
+
+fn createFile(io: std.Io, path: []const u8) !File {
+    // `truncate = false` because the caller may be resuming into a file it preallocated on an
+    // earlier run, and throwing those bytes away would restart the download.
+    return if (std.fs.path.isAbsolute(path))
+        Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = false })
+    else
+        Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+}
 
 fn zpath(gpa: std.mem.Allocator, parts: []const []const u8) ![:0]u8 {
     var b: std.ArrayList(u8) = .empty;
@@ -80,32 +82,23 @@ fn zpath(gpa: std.mem.Allocator, parts: []const []const u8) ![:0]u8 {
 }
 
 /// Create every directory on the way to `path`, ignoring the ones already there.
-fn mkdirs(gpa: std.mem.Allocator, path: []const u8) !void {
-    const buf = try gpa.dupeZ(u8, path);
-    var i: usize = 1;
-    while (i < buf.len) : (i += 1) {
-        if (buf[i] != '/') continue;
-        buf[i] = 0;
-        _ = mkdir(buf.ptr, 0o755);
-        buf[i] = '/';
+fn mkdirs(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        var root = try Dir.openDirAbsolute(io, "/", .{});
+        defer root.close(io);
+        try root.createDirPath(io, path[1..]);
+    } else {
+        try Dir.cwd().createDirPath(io, path);
     }
-    _ = mkdir(buf.ptr, 0o755);
 }
 
-fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const zp = try gpa.dupeZ(u8, path);
-    const fd = open(zp.ptr, O_RDONLY);
-    if (fd < 0) return error.OpenFailed;
-    defer _ = close(fd);
-    var list: std.ArrayList(u8) = .empty;
-    var buf: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = read(fd, &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        try list.appendSlice(gpa, buf[0..@intCast(n)]);
-    }
-    return list.toOwnedSlice(gpa);
+fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const f = try openFile(io, path, .read_only);
+    defer f.close(io);
+    const len = try f.length(io);
+    const buf = try gpa.alloc(u8, @intCast(len));
+    _ = try f.readPositionalAll(io, buf, 0);
+    return buf;
 }
 
 fn human(n: u64, buf: []u8) []const u8 {
@@ -185,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
     // `stubs` needs no stub of its own, so it runs before we go looking for one.
     if (std.mem.eql(u8, verb, "stubs")) {
         const dir = out_dir orelse ".";
-        try mkdirs(gpa, dir);
+        try mkdirs(init.io, dir);
         var got: usize = 0;
         for (products) |p| for ([_][]const u8{ "WIN", "MAC" }) |o| for (locales) |l| {
             const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{ getlegacy, p, l, o });
@@ -194,11 +187,10 @@ pub fn main(init: std.process.Init) !void {
             const ext: []const u8 = if (std.mem.eql(u8, o, "MAC")) "zip" else "exe";
             const name = try std.fmt.allocPrint(gpa, "{s}_{s}_{s}.{s}", .{ p, l, o, ext });
             const full = try zpath(gpa, &.{ dir, name });
-            const fd = open(full.ptr, O_RDWR_CREAT, @as(c_uint, 0o644));
-            if (fd < 0) continue;
-            _ = pwrite(fd, body.ptr, body.len, 0);
-            _ = ftruncate(fd, @intCast(body.len));
-            _ = close(fd);
+            const f = createFile(init.io, full) catch continue;
+            defer f.close(init.io);
+            f.writePositionalAll(init.io, body, 0) catch continue;
+            f.setLength(init.io, body.len) catch continue;
             got += 1;
             std.debug.print("  {s}  {d} bytes\n", .{ name, body.len });
         };
@@ -206,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const stub = try resolveStub(gpa, &client, argv[2], locale, os_);
+    const stub = try resolveStub(gpa, init.io, &client, argv[2], locale, os_);
     var meta = try legacy.fromStub(gpa, stub);
 
     // The pieces are numbered files under one base, so any host laid out the same way serves
@@ -260,17 +252,16 @@ pub fn main(init: std.process.Init) !void {
     // The payload's own top-level directory, so an assembled tree matches what the stub expects
     // to launch.
     const dest = try zpath(gpa, &.{ dir_path, meta.name });
-    try mkdirs(gpa, dest);
+    try mkdirs(init.io, dest);
 
     // Preallocate every file at full length once, so a piece can be written wherever it lands
     // without caring whether the bytes around it have arrived yet.
     for (meta.files) |f| {
         const full = try zpath(gpa, &.{ dest, f.path });
-        if (std.mem.lastIndexOfScalar(u8, full, '/')) |at| try mkdirs(gpa, full[0..at]);
-        const fd = open(full.ptr, O_RDWR_CREAT, @as(c_uint, 0o644));
-        if (fd < 0) return error.OpenFailed;
-        defer _ = close(fd);
-        if (ftruncate(fd, @intCast(f.length)) != 0) return error.TruncateFailed;
+        if (std.mem.lastIndexOfScalar(u8, full, '/')) |at| try mkdirs(init.io, full[0..at]);
+        const fh = try createFile(init.io, full);
+        defer fh.close(init.io);
+        try fh.setLength(init.io, f.length);
     }
 
     if (std.mem.eql(u8, verb, "verify")) {
@@ -279,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
         var p = from;
         while (p <= last) : (p += 1) {
             const want = meta.pieceSize(p);
-            const got = try readPiece(meta, gpa, dest, p, buf[0..want]);
+            const got = try readPiece(meta, gpa, init.io, dest, p, buf[0..want]);
             meta.verify(p, got) catch {
                 bad += 1;
                 std.debug.print("  piece {d}: BAD\n", .{p});
@@ -326,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
                 last_err = "hash mismatch";
                 continue;
             };
-            try writePiece(meta, gpa, dest, p, body);
+            try writePiece(meta, gpa, init.io, dest, p, body);
             break true;
         } else false;
 
@@ -354,12 +345,13 @@ pub fn main(init: std.process.Init) !void {
 /// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
 fn resolveStub(
     gpa: std.mem.Allocator,
+    io: std.Io,
     client: *std.http.Client,
     arg: []const u8,
     locale: []const u8,
     os_: []const u8,
 ) ![]u8 {
-    if (readFile(gpa, arg)) |bytes| return bytes else |_| {}
+    if (readFile(gpa, io, arg)) |bytes| return bytes else |_| {}
 
     var code: std.ArrayList(u8) = .empty;
     for (arg) |c| try code.append(gpa, std.ascii.toUpper(c));
@@ -401,31 +393,26 @@ fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8) !
 
 /// A piece rarely lands in one file — it routinely straddles the end of one and the start of
 /// the next — so writing one means walking its spans.
-fn writePiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, dest: []const u8, index: usize, data: []const u8) !void {
+fn writePiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, io: std.Io, dest: []const u8, index: usize, data: []const u8) !void {
     var at: usize = 0;
     for (try legacy.spansForPiece(meta, gpa, index)) |s| {
         const full = try zpath(gpa, &.{ dest, meta.files[s.file].path });
-        const fd = open(full.ptr, O_RDWR);
-        if (fd < 0) return error.OpenFailed;
-        defer _ = close(fd);
+        const f = try openFile(io, full, .read_write);
+        defer f.close(io);
         const n: usize = @intCast(s.len);
-        if (pwrite(fd, data[at..].ptr, n, @intCast(s.offset)) != @as(isize, @intCast(n)))
-            return error.WriteFailed;
+        try f.writePositionalAll(io, data[at..][0..n], s.offset);
         at += n;
     }
 }
 
-fn readPiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, dest: []const u8, index: usize, buf: []u8) ![]u8 {
+fn readPiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, io: std.Io, dest: []const u8, index: usize, buf: []u8) ![]u8 {
     var at: usize = 0;
     for (try legacy.spansForPiece(meta, gpa, index)) |s| {
         const full = try zpath(gpa, &.{ dest, meta.files[s.file].path });
-        const fd = open(full.ptr, O_RDONLY);
-        if (fd < 0) return error.OpenFailed;
-        defer _ = close(fd);
+        const f = try openFile(io, full, .read_only);
+        defer f.close(io);
         const n: usize = @intCast(s.len);
-        const got = pread(fd, buf[at..].ptr, n, @intCast(s.offset));
-        if (got < 0) return error.ReadFailed;
-        at += @intCast(got);
+        at += try f.readPositionalAll(io, buf[at..][0..n], s.offset);
     }
     return buf[0..at];
 }

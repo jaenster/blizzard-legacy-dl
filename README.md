@@ -176,3 +176,7 @@ try meta.verify(0, piece_bytes);
 ```
 
 `zig build test` covers the bencode decoder, short final pieces and URL construction.
+`scripts/roundtrip.py` covers the rest end to end: it builds a payload, serves it as numbered
+pieces the way the CDN did, fetches it back through `--base`, and compares byte for byte. Both
+run in CI, which is what keeps the download path honest now that there is nothing live to test
+against.
