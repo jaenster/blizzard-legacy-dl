@@ -21,11 +21,29 @@ const usage =
     \\  --to <n>     last piece, inclusive (default: the last one)
     \\  --retries <n>  per-piece retries before giving up (default 3)
     \\
-    \\Get a stub from Blizzard:
-    \\  curl -LOJ 'https://www.battle.net/download/getLegacy?product=D2DV&locale=en-US&os=WIN'
-    \\  products: D2DV D2XP STAR WAR3 W3XP   os: WIN MAC
+    \\<stub> is a downloader .exe, a Mac .app binary, a .torrent — or just a product code,
+    \\which is fetched from Blizzard on the spot:
+    \\
+    \\  blizzard-legacy-dl info d2xp
+    \\  blizzard-legacy-dl info star --locale de-DE --os MAC
+    \\
+    \\  products: D2DV D2XP STAR WAR3 W3XP    os: WIN (default) or MAC
+    \\  locale defaults to en-US; D2 also has en-GB de-DE es-ES fr-FR it-IT ko-KR pl-PL zh-TW
+    \\
+    \\  stubs -o <dir>   download every product/locale/os stub there is
     \\
 ;
+
+/// Blizzard's own endpoint. `www.battle.net` bounces through `eu.battle.net` to get here, so go
+/// straight to it. It rate-limits: back-to-back requests come back empty, which looks exactly
+/// like a missing product until you slow down.
+const getlegacy = "https://downloader.battle.net/download/getLegacy";
+
+const products = [_][]const u8{ "D2DV", "D2XP", "STAR", "WAR3", "W3XP" };
+const locales = [_][]const u8{
+    "en-US", "en-GB", "de-DE", "es-ES", "es-MX", "fr-FR", "it-IT",
+    "ja-JP", "ko-KR", "pl-PL", "pt-BR", "ru-RU", "zh-CN", "zh-TW",
+};
 
 // std.fs is reworked under 0.16's Io interface and wants an event loop; the sibling tools in
 // this stack talk to libc directly for file work, so this does too.
@@ -99,9 +117,10 @@ pub fn main(init: std.process.Init) !void {
         return error.Usage;
     }
     const verb = argv[1];
-    const meta = try legacy.fromStub(gpa, try readFile(gpa, argv[2]));
 
     var out_dir: ?[]const u8 = null;
+    var locale: []const u8 = "en-US";
+    var os_: []const u8 = "WIN";
     var from: usize = 0;
     var to: ?usize = null;
     var retries: usize = 3;
@@ -120,8 +139,47 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--retries") and i + 1 < argv.len) {
             i += 1;
             retries = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--locale") and i + 1 < argv.len) {
+            i += 1;
+            locale = argv[i];
+        } else if (std.mem.eql(u8, a, "--os") and i + 1 < argv.len) {
+            i += 1;
+            os_ = argv[i];
         }
     }
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = init.io };
+    defer client.deinit();
+
+    // `stubs` needs no stub of its own, so it runs before we go looking for one.
+    if (std.mem.eql(u8, verb, "stubs")) {
+        const dir = out_dir orelse {
+            std.debug.print("{s}", .{usage});
+            return error.NeedOutDir;
+        };
+        try mkdirs(gpa, dir);
+        var got: usize = 0;
+        for (products) |p| for ([_][]const u8{ "WIN", "MAC" }) |o| for (locales) |l| {
+            const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{ getlegacy, p, l, o });
+            const body = fetchUrl(gpa, &client, url) catch continue;
+            if (body.len < 1024) continue; // an empty reply is the rate limiter, not a 404
+            const ext: []const u8 = if (std.mem.eql(u8, o, "MAC")) "zip" else "exe";
+            const name = try std.fmt.allocPrint(gpa, "{s}_{s}_{s}.{s}", .{ p, l, o, ext });
+            const full = try zpath(gpa, &.{ dir, name });
+            const fd = open(full.ptr, O_RDWR | O_CREAT, @as(c_uint, 0o644));
+            if (fd < 0) continue;
+            _ = pwrite(fd, body.ptr, body.len, 0);
+            _ = ftruncate(fd, @intCast(body.len));
+            _ = close(fd);
+            got += 1;
+            std.debug.print("  {s}  {d} bytes\n", .{ name, body.len });
+        };
+        std.debug.print("{d} stubs -> {s}\n", .{ got, dir });
+        return;
+    }
+
+    const stub = try resolveStub(gpa, &client, argv[2], locale, os_);
+    const meta = try legacy.fromStub(gpa, stub);
 
     var b1: [32]u8 = undefined;
     if (std.mem.eql(u8, verb, "info")) {
@@ -205,9 +263,6 @@ pub fn main(init: std.process.Init) !void {
         return error.Usage;
     }
 
-    var client: std.http.Client = .{ .allocator = gpa, .io = init.io };
-    defer client.deinit();
-
     var done: usize = 0;
     var failed: usize = 0;
     var p = from;
@@ -242,6 +297,33 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
     if (failed != 0) return error.Incomplete;
+}
+
+/// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
+fn resolveStub(
+    gpa: std.mem.Allocator,
+    client: *std.http.Client,
+    arg: []const u8,
+    locale: []const u8,
+    os_: []const u8,
+) ![]u8 {
+    if (readFile(gpa, arg)) |bytes| return bytes else |_| {}
+
+    var code: std.ArrayList(u8) = .empty;
+    for (arg) |c| try code.append(gpa, std.ascii.toUpper(c));
+    const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{
+        getlegacy, code.items, locale, os_,
+    });
+    const body = fetchUrl(gpa, client, url) catch {
+        std.debug.print("no file '{s}', and fetching product {s} failed\n", .{ arg, code.items });
+        return error.NoStub;
+    };
+    // The endpoint answers 200 with nothing when it is rate-limiting, so size is the real check.
+    if (body.len < 1024) {
+        std.debug.print("product {s} ({s}, {s}) returned nothing — unknown product, or you are being rate-limited\n", .{ code.items, locale, os_ });
+        return error.NoStub;
+    }
+    return body;
 }
 
 fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]u8 {

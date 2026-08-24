@@ -153,8 +153,46 @@ pub const Metainfo = struct {
     }
 };
 
-/// Find and decode the torrent embedded in a downloader stub.
-pub fn fromStub(gpa: std.mem.Allocator, exe: []const u8) !Metainfo {
+/// The Mac stub is a zip of an .app bundle, and its torrent is a separate compressed member
+/// rather than bytes sitting in the executable — so scanning the raw file finds nothing. Pull
+/// the member out before looking.
+fn torrentFromZip(gpa: std.mem.Allocator, zip: []const u8) ?[]u8 {
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, zip, at, "PK\x03\x04")) |h| {
+        at = h + 4;
+        if (h + 30 > zip.len) break;
+        const method = std.mem.readInt(u16, zip[h + 8 ..][0..2], .little);
+        const csize = std.mem.readInt(u32, zip[h + 18 ..][0..4], .little);
+        const usize_ = std.mem.readInt(u32, zip[h + 22 ..][0..4], .little);
+        const name_len = std.mem.readInt(u16, zip[h + 26 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, zip[h + 28 ..][0..2], .little);
+        const name_at = h + 30;
+        if (name_at + name_len > zip.len) break;
+        const name = zip[name_at..][0..name_len];
+        const data_at = name_at + name_len + extra_len;
+        if (data_at + csize > zip.len) continue;
+        if (!std.mem.endsWith(u8, name, ".torrent")) continue;
+
+        const src = zip[data_at..][0..csize];
+        if (method == 0) return gpa.dupe(u8, src) catch null;
+        if (method != 8) continue;
+        const out = gpa.alloc(u8, usize_) catch return null;
+        var in = std.Io.Reader.fixed(src);
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var d = std.compress.flate.Decompress.init(&in, .raw, &window);
+        const n = d.reader.readSliceShort(out) catch return null;
+        return out[0..n];
+    }
+    return null;
+}
+
+/// Find and decode the torrent a downloader stub carries. Accepts a Windows .exe (bencode inside
+/// the image), a Mac .zip (a `.torrent` member in the .app bundle), or a plain .torrent.
+pub fn fromStub(gpa: std.mem.Allocator, stub: []const u8) !Metainfo {
+    const exe = if (std.mem.startsWith(u8, stub, "PK\x03\x04"))
+        torrentFromZip(gpa, stub) orelse return Error.NoTorrent
+    else
+        stub;
     // Every one of these starts its dictionary with the announce key; scanning for that is more
     // robust than trusting a section layout that varies between the Windows and Mac stubs.
     var search: usize = 0;

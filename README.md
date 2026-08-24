@@ -4,11 +4,22 @@ Reads a Blizzard legacy downloader stub and fetches what it points at, without r
 
 ```
 zig build
-zig-out/bin/blizzard-legacy-dl info  Downloader_Diablo2_enUS.exe
-zig-out/bin/blizzard-legacy-dl fetch Downloader_Diablo2_enUS.exe -o ./out
+zig-out/bin/blizzard-legacy-dl info  D2XP
+zig-out/bin/blizzard-legacy-dl fetch D2XP -o ./out
 ```
 
-## Getting a stub
+You can pass a product code and it grabs the stub from Blizzard itself. A path works too, if you
+already have one:
+
+```
+zig-out/bin/blizzard-legacy-dl info Downloader_Diablo2_enUS.exe
+zig-out/bin/blizzard-legacy-dl info STAR --locale de-DE --os MAC
+zig-out/bin/blizzard-legacy-dl stubs -o ./stubs        # all 85 of them
+```
+
+`--locale` defaults to `en-US`, `--os` to `WIN`.
+
+## Where the stubs come from
 
 Blizzard still serves them, no account needed:
 
@@ -82,6 +93,7 @@ and this tool cannot invent access it does not have.
 
 ```
 info    <stub>                     name, infohash, piece count, size, both URLs
+stubs   -o <dir>                   download every product/locale/os stub there is
 files   <stub>                     the payload's file list
 plan    <stub> [n]                 piece count, URL for piece n, files it spans
 fetch   <stub> -o <dir>            fetch every piece, verify it, assemble
@@ -89,7 +101,8 @@ fetch   <stub> -o <dir>            fetch every piece, verify it, assemble
 verify  <stub> -o <dir>            re-check an assembled payload piece by piece
 ```
 
-`<stub>` is the downloader `.exe`, the Mac `.app`'s binary, or a plain `.torrent`.
+`<stub>` is a product code (`D2XP`), a downloader `.exe`, a Mac `.zip`, or a plain `.torrent`.
+A code is resolved through getLegacy on the spot.
 
 Files get preallocated at full length first, then each piece is written with `pwrite` into
 whichever files it lands in. Pieces straddle file boundaries constantly, so this matters. It also
