@@ -21,10 +21,16 @@ RUN apk add --no-cache curl tar xz && \
 WORKDIR /src
 COPY build.zig build.zig.zon ./
 COPY src ./src
-RUN case "$TARGETARCH" in \
+# TARGETARCH is only set by buildx; fall back to the machine arch so a plain
+# `docker build` works too.
+RUN arch="${TARGETARCH:-}"; \
+    if [ -z "$arch" ]; then \
+      case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; esac; \
+    fi && \
+    case "$arch" in \
       amd64) zt=x86_64-linux-musl ;; \
       arm64) zt=aarch64-linux-musl ;; \
-      *) echo "no zig target for $TARGETARCH" >&2; exit 1 ;; \
+      *) echo "no zig target for '$arch'" >&2; exit 1 ;; \
     esac && \
     zig build -Doptimize=ReleaseFast -Dtarget="$zt" --prefix /out
 

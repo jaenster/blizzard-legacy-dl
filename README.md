@@ -103,13 +103,14 @@ info    <stub>                     name, infohash, piece count, size, both URLs
 stubs   -o <dir>                   download every product/locale/os stub there is
 files   <stub>                     the payload's file list
 plan    <stub> [n]                 piece count, URL for piece n, files it spans
-fetch   <stub> -o <dir>            fetch every piece, verify it, assemble
+fetch   <stub> [-o dir]            fetch every piece, verify it, assemble
         [--from n] [--to n] [--retries n]
-verify  <stub> -o <dir>            re-check an assembled payload piece by piece
+verify  <stub> [-o dir]            re-check an assembled payload piece by piece
 ```
 
 `<stub>` is a product code (`D2XP`), a downloader `.exe`, a Mac `.zip`, or a plain `.torrent`.
-A code is resolved through getLegacy on the spot.
+A code is resolved through getLegacy on the spot. `-o` defaults to the current directory; the
+payload always lands in a subdirectory named after the torrent, so nothing gets strewn about.
 
 Files get preallocated at full length first, then each piece is written with `pwrite` into
 whichever files it lands in. Pieces straddle file boundaries constantly, so this matters. It also

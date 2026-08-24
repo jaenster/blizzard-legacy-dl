@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "legacy", .module = legacy }},
+            // the file IO goes through libc: std.fs is reworked under 0.16's Io interface
+            .link_libc = true,
         }),
     });
     b.installArtifact(cli);
