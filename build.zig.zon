@@ -1,0 +1,13 @@
+.{
+    .name = .blizzard_legacy_dl,
+    .version = "0.1.0",
+    .fingerprint = 0x28fb401ea38e62d5,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}

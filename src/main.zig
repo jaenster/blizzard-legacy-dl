@@ -1,0 +1,291 @@
+//! blizzard-legacy-dl — fetch what Blizzard's legacy downloader stub points at.
+//!
+//! See src/legacy.zig for how the HTTP piece source actually works. The short version: the
+//! payload is served as one numbered file per BitTorrent piece, so pieces can be fetched in any
+//! order, each is verifiable on its own, and there is no session or token to establish.
+
+const std = @import("std");
+const legacy = @import("legacy");
+
+const usage =
+    \\blizzard-legacy-dl — read a Blizzard legacy downloader stub and fetch its payload
+    \\
+    \\  info    <stub.exe>                 what the stub carries
+    \\  files   <stub.exe>                 the payload's file list
+    \\  plan    <stub.exe> [n]             piece count, and the URL for piece n
+    \\  fetch   <stub.exe> -o <dir> [opts] fetch, verify and assemble the payload
+    \\  verify  <stub.exe> -o <dir>        re-verify an assembled payload
+    \\
+    \\fetch options:
+    \\  --from <n>   first piece (default 0)
+    \\  --to <n>     last piece, inclusive (default: the last one)
+    \\  --retries <n>  per-piece retries before giving up (default 3)
+    \\
+    \\Get a stub from Blizzard:
+    \\  curl -LOJ 'https://www.battle.net/download/getLegacy?product=D2DV&locale=en-US&os=WIN'
+    \\  products: D2DV D2XP STAR WAR3 W3XP   os: WIN MAC
+    \\
+;
+
+// std.fs is reworked under 0.16's Io interface and wants an event loop; the sibling tools in
+// this stack talk to libc directly for file work, so this does too.
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
+extern "c" fn pread(fd: c_int, buf: [*]u8, n: usize, off: i64) isize;
+extern "c" fn pwrite(fd: c_int, buf: [*]const u8, n: usize, off: i64) isize;
+extern "c" fn ftruncate(fd: c_int, len: i64) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+
+const O_RDONLY: c_int = 0;
+const O_RDWR: c_int = 2;
+const O_CREAT: c_int = 0x0200;
+
+fn zpath(gpa: std.mem.Allocator, parts: []const []const u8) ![:0]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    for (parts, 0..) |p, i| {
+        if (i != 0 and b.items.len != 0) try b.append(gpa, '/');
+        try b.appendSlice(gpa, p);
+    }
+    return b.toOwnedSliceSentinel(gpa, 0);
+}
+
+/// Create every directory on the way to `path`, ignoring the ones already there.
+fn mkdirs(gpa: std.mem.Allocator, path: []const u8) !void {
+    const buf = try gpa.dupeZ(u8, path);
+    var i: usize = 1;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] != '/') continue;
+        buf[i] = 0;
+        _ = mkdir(buf.ptr, 0o755);
+        buf[i] = '/';
+    }
+    _ = mkdir(buf.ptr, 0o755);
+}
+
+fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const zp = try gpa.dupeZ(u8, path);
+    const fd = open(zp.ptr, O_RDONLY);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = close(fd);
+    var list: std.ArrayList(u8) = .empty;
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try list.appendSlice(gpa, buf[0..@intCast(n)]);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+fn human(n: u64, buf: []u8) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB" };
+    var v: f64 = @floatFromInt(n);
+    var u: usize = 0;
+    while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
+    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[u] }) catch "?";
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.arena.allocator();
+
+    const argv_z = try init.minimal.args.toSlice(gpa);
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    for (argv_z) |a| try argv_list.append(gpa, std.mem.sliceTo(a, 0));
+    const argv = argv_list.items;
+    if (argv.len < 3) {
+        std.debug.print(usage, .{});
+        return error.Usage;
+    }
+    const verb = argv[1];
+    const meta = try legacy.fromStub(gpa, try readFile(gpa, argv[2]));
+
+    var out_dir: ?[]const u8 = null;
+    var from: usize = 0;
+    var to: ?usize = null;
+    var retries: usize = 3;
+    var i: usize = 3;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if ((std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--out")) and i + 1 < argv.len) {
+            i += 1;
+            out_dir = argv[i];
+        } else if (std.mem.eql(u8, a, "--from") and i + 1 < argv.len) {
+            i += 1;
+            from = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--to") and i + 1 < argv.len) {
+            i += 1;
+            to = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--retries") and i + 1 < argv.len) {
+            i += 1;
+            retries = try std.fmt.parseInt(usize, argv[i], 10);
+        }
+    }
+
+    var b1: [32]u8 = undefined;
+    if (std.mem.eql(u8, verb, "info")) {
+        std.debug.print(
+            \\name            : {s}
+            \\locale          : {s}
+            \\launch target   : {s}
+            \\infohash        : {x}
+            \\announce        : {s}   (dead since ~2016)
+            \\direct download : {s}
+            \\piece length    : {d}
+            \\pieces          : {d}
+            \\files           : {d}
+            \\total           : {d} bytes ({s})
+            \\
+        , .{
+            meta.name,       meta.locale, meta.launch_target, meta.infohash,
+            meta.announce,   meta.direct_download,
+            meta.piece_length, meta.pieceCount(), meta.files.len,
+            meta.total,      human(meta.total, &b1),
+        });
+        return;
+    }
+    if (std.mem.eql(u8, verb, "files")) {
+        for (meta.files) |f| std.debug.print("{d:>12}  {s}\n", .{ f.length, f.path });
+        return;
+    }
+    if (std.mem.eql(u8, verb, "plan")) {
+        const n = if (argv.len > 3) std.fmt.parseInt(usize, argv[3], 10) catch 0 else 0;
+        const url = try meta.pieceUrl(gpa, n, null);
+        std.debug.print("{d} pieces, {d} bytes each ({d} for the last)\n", .{
+            meta.pieceCount(), meta.piece_length, meta.pieceSize(meta.pieceCount() - 1),
+        });
+        std.debug.print("piece {d}: {s}\n", .{ n, url });
+        std.debug.print("  spans:\n", .{});
+        for (try legacy.spansForPiece(meta, gpa, n)) |s|
+            std.debug.print("    {s} +{d} for {d}\n", .{ meta.files[s.file].path, s.offset, s.len });
+        return;
+    }
+
+    const dir_path = out_dir orelse {
+        std.debug.print("{s}", .{usage});
+        return error.NeedOutDir;
+    };
+    const last = to orelse meta.pieceCount() - 1;
+
+    // The payload's own top-level directory, so an assembled tree matches what the stub expects
+    // to launch.
+    const dest = try zpath(gpa, &.{ dir_path, meta.name });
+    try mkdirs(gpa, dest);
+
+    // Preallocate every file at full length once, so a piece can be written wherever it lands
+    // without caring whether the bytes around it have arrived yet.
+    for (meta.files) |f| {
+        const full = try zpath(gpa, &.{ dest, f.path });
+        if (std.mem.lastIndexOfScalar(u8, full, '/')) |at| try mkdirs(gpa, full[0..at]);
+        const fd = open(full.ptr, O_RDWR | O_CREAT, @as(c_uint, 0o644));
+        if (fd < 0) return error.OpenFailed;
+        defer _ = close(fd);
+        if (ftruncate(fd, @intCast(f.length)) != 0) return error.TruncateFailed;
+    }
+
+    if (std.mem.eql(u8, verb, "verify")) {
+        var bad: usize = 0;
+        var buf = try gpa.alloc(u8, meta.piece_length);
+        var p = from;
+        while (p <= last) : (p += 1) {
+            const want = meta.pieceSize(p);
+            const got = try readPiece(meta, gpa, dest, p, buf[0..want]);
+            meta.verify(p, got) catch {
+                bad += 1;
+                std.debug.print("  piece {d}: BAD\n", .{p});
+            };
+        }
+        std.debug.print("{d} pieces checked, {d} bad\n", .{ last - from + 1, bad });
+        return if (bad == 0) {} else error.Corrupt;
+    }
+
+    if (!std.mem.eql(u8, verb, "fetch")) {
+        std.debug.print("{s}", .{usage});
+        return error.Usage;
+    }
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = init.io };
+    defer client.deinit();
+
+    var done: usize = 0;
+    var failed: usize = 0;
+    var p = from;
+    while (p <= last) : (p += 1) {
+        const want = meta.pieceSize(p);
+        var attempt: usize = 0;
+        const ok = while (attempt <= retries) : (attempt += 1) {
+            // The salt is the downloader's own cache-buster, used only after a bad piece.
+            var salt: [12]u8 = undefined;
+            const s: ?[]const u8 = if (attempt == 0) null else blk: {
+                const alpha = "abcdefghijklmnopqrstuvwxyz1234567890";
+                var prng = std.Random.DefaultPrng.init(@as(u64, p) *% 1000003 +% attempt);
+                for (&salt) |*c| c.* = alpha[prng.random().uintLessThan(usize, alpha.len)];
+                break :blk salt[0..];
+            };
+            const url = try meta.pieceUrl(gpa, p, s);
+            const body = fetchUrl(gpa, &client, url) catch continue;
+            if (body.len != want) continue;
+            meta.verify(p, body) catch continue;
+            try writePiece(meta, gpa, dest, p, body);
+            break true;
+        } else false;
+
+        if (ok) {
+            done += 1;
+            if (done % 25 == 0 or p == last)
+                std.debug.print("\r  {d}/{d} pieces", .{ done, last - from + 1 });
+        } else {
+            failed += 1;
+            std.debug.print("\n  piece {d}: FAILED after {d} tries\n", .{ p, retries + 1 });
+        }
+    }
+    std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
+    if (failed != 0) return error.Incomplete;
+}
+
+fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    const res = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .user_agent = .{ .override = legacy.user_agent } },
+        .extra_headers = &.{
+            .{ .name = "Pragma", .value = "no-cache" },
+        },
+        .response_writer = &body.writer,
+    });
+    if (res.status != .ok and res.status != .partial_content) return error.HttpStatus;
+    return body.written();
+}
+
+/// A piece rarely lands in one file — it routinely straddles the end of one and the start of
+/// the next — so writing one means walking its spans.
+fn writePiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, dest: []const u8, index: usize, data: []const u8) !void {
+    var at: usize = 0;
+    for (try legacy.spansForPiece(meta, gpa, index)) |s| {
+        const full = try zpath(gpa, &.{ dest, meta.files[s.file].path });
+        const fd = open(full.ptr, O_RDWR);
+        if (fd < 0) return error.OpenFailed;
+        defer _ = close(fd);
+        const n: usize = @intCast(s.len);
+        if (pwrite(fd, data[at..].ptr, n, @intCast(s.offset)) != @as(isize, @intCast(n)))
+            return error.WriteFailed;
+        at += n;
+    }
+}
+
+fn readPiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, dest: []const u8, index: usize, buf: []u8) ![]u8 {
+    var at: usize = 0;
+    for (try legacy.spansForPiece(meta, gpa, index)) |s| {
+        const full = try zpath(gpa, &.{ dest, meta.files[s.file].path });
+        const fd = open(full.ptr, O_RDONLY);
+        if (fd < 0) return error.OpenFailed;
+        defer _ = close(fd);
+        const n: usize = @intCast(s.len);
+        const got = pread(fd, buf[at..].ptr, n, @intCast(s.offset));
+        if (got < 0) return error.ReadFailed;
+        at += @intCast(got);
+    }
+    return buf[0..at];
+}
