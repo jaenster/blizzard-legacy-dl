@@ -78,8 +78,11 @@ def main():
 
         binary = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", BIN)) \
             if not os.path.isabs(BIN) else BIN
-        for verb in ("fetch", "verify"):
-            cmd = [binary, verb, torrent, "-o", out] + (["--base", base] if verb == "fetch" else [])
+        # "run" rather than "fetch", so the whole client sequence is what gets covered, not
+        # just the piece loop. The tracker in this fixture is deliberately unreachable.
+        for verb in ("run", "verify"):
+            cmd = [binary, verb, torrent, "-o", out] + (
+                ["--base", base, "--no-tracker"] if verb == "run" else [])
             r = subprocess.run(cmd, capture_output=True, text=True)
             # Progress goes to stderr, so both streams matter.
             said = (r.stdout + r.stderr).strip()

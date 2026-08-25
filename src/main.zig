@@ -16,6 +16,7 @@ const usage =
     \\  plan    <stub.exe> [n]             piece count, and the URL for piece n
     \\  fetch   <stub> [-o dir] [opts]     fetch, verify and assemble the payload
     \\  verify  <stub> [-o dir]            re-verify an assembled payload
+    \\  run     <stub> [-o dir] [opts]     the whole downloader sequence, headless
     \\  proxy   [--port n]                 watch what the real downloader sends, verbatim
     \\
     \\fetch options:
@@ -23,6 +24,12 @@ const usage =
     \\  --to <n>     last piece, inclusive (default: the last one)
     \\  --retries <n>  per-piece retries before giving up (default 3)
     \\  --base <url> fetch pieces from a mirror instead of the (dead) Blizzard host
+    \\  --sequential   fetch pieces in order; the client shuffles them, and so do we
+    \\
+    \\run options (run does everything fetch does, in the client's order):
+    \\  --ini <path>          a BlizzardDownloader.ini to read config from
+    \\  --server-config <url> also ask a host for /update/Downloader.ini, as the client does
+    \\  --no-tracker          skip the announce
     \\
     \\<stub> is a downloader .exe, a Mac .app binary, a .torrent — or just a product code,
     \\which is fetched from Blizzard on the spot:
@@ -129,6 +136,10 @@ pub fn main(init: std.process.Init) !void {
     var to: ?usize = null;
     var retries: usize = 3;
     var base: ?[]const u8 = null;
+    var ini_path: ?[]const u8 = null;
+    var server_config: ?[]const u8 = null;
+    var no_tracker = false;
+    var sequential = false;
     var i: usize = 3;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -144,6 +155,16 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--retries") and i + 1 < argv.len) {
             i += 1;
             retries = try std.fmt.parseInt(usize, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--ini") and i + 1 < argv.len) {
+            i += 1;
+            ini_path = argv[i];
+        } else if (std.mem.eql(u8, a, "--server-config") and i + 1 < argv.len) {
+            i += 1;
+            server_config = argv[i];
+        } else if (std.mem.eql(u8, a, "--no-tracker")) {
+            no_tracker = true;
+        } else if (std.mem.eql(u8, a, "--sequential")) {
+            sequential = true;
         } else if (std.mem.eql(u8, a, "--base") and i + 1 < argv.len) {
             i += 1;
             base = argv[i];
@@ -202,8 +223,115 @@ pub fn main(init: std.process.Init) !void {
     var meta = try legacy.fromStub(gpa, stub);
 
     // The pieces are numbered files under one base, so any host laid out the same way serves
-    // them — which matters, because Blizzard's own no longer does. See README.
-    if (base) |b| meta.direct_download = std.mem.trimEnd(u8, b, "/");
+    // them — which matters, because Blizzard's own no longer does. This replaces the whole
+    // server set the torrent named, and it goes through the same expansion the client uses, so
+    // `--base 'http://m[1-4]/p'` names four mirrors. See README.
+    if (base) |b| {
+        var mirrors: std.ArrayList(legacy.Server) = .empty;
+        try legacy.expandServerUrls(gpa, std.mem.trimEnd(u8, b, "/"), &mirrors);
+        meta.servers = try mirrors.toOwnedSlice(gpa);
+        meta.direct_download = b;
+    }
+
+    // `run` walks the client's own start-up sequence rather than jumping straight to the
+    // pieces. Each stage is printed as it happens, because most of the interesting behaviour is
+    // in what the client asks for before it fetches anything.
+    if (std.mem.eql(u8, verb, "run")) {
+        std.debug.print("1  stub          {s} ({d} bytes)\n", .{ argv[2], stub.len });
+        std.debug.print("2  metainfo      {s}, {d} pieces, {d} files, {x}\n", .{
+            meta.name, meta.pieceCount(), meta.files.len, meta.infohash,
+        });
+
+        // Config, from an ini in the client's own format. directDownloadURL replaces the base;
+        // cookieName and cookieData are only used when both are present.
+        var cookie_name: ?[]const u8 = null;
+        var cookie_data: ?[]const u8 = null;
+        if (ini_path) |path| {
+            const text = try readFile(gpa, init.io, path);
+            var keys: usize = 0;
+            var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t");
+                if (line.len == 0 or line[0] == ';' or line[0] == '#' or line[0] == '[') continue;
+                const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+                const key = std.mem.trim(u8, line[0..eq], " \t");
+                const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+                keys += 1;
+                if (std.mem.eql(u8, key, "directDownloadURL")) {
+                    var mirrors: std.ArrayList(legacy.Server) = .empty;
+                    try legacy.expandServerUrls(gpa, val, &mirrors);
+                    meta.servers = try mirrors.toOwnedSlice(gpa);
+                    std.debug.print("     directDownloadURL overrides the base: {s}\n", .{val});
+                } else if (std.mem.eql(u8, key, "cookieName")) {
+                    cookie_name = val;
+                } else if (std.mem.eql(u8, key, "cookieData")) {
+                    cookie_data = val;
+                } else if (std.mem.eql(u8, key, "dontusetracker") or std.mem.eql(u8, key, "trackerless")) {
+                    no_tracker = true;
+                }
+            }
+            std.debug.print("3  config        {s}, {d} keys\n", .{ path, keys });
+        } else {
+            std.debug.print("3  config        none (no --ini)\n", .{});
+        }
+        if (cookie_name) |n| if (cookie_data) |d| {
+            cookie = try std.fmt.allocPrint(gpa, "{s}={s}", .{ n, d });
+            std.debug.print("     cookie {s} will be sent with every piece\n", .{n});
+        };
+
+        // The client asks a hardcoded host for a server-side config before it transfers
+        // anything, and simply waits out the timeout when that host is gone.
+        if (server_config) |host| {
+            const url = try std.fmt.allocPrint(gpa, "{s}/update/Downloader.ini", .{
+                std.mem.trimEnd(u8, host, "/"),
+            });
+            std.debug.print("4  server config {s}\n", .{url});
+            if (fetchUrl(gpa, &client, url)) |body| {
+                std.debug.print("     {d} bytes\n", .{body.len});
+            } else |e| {
+                std.debug.print("     no answer ({t}) — the client ignores this too\n", .{e});
+            }
+        } else {
+            std.debug.print("4  server config skipped (no --server-config)\n", .{});
+        }
+
+        std.debug.print("5  servers       {d}\n", .{meta.servers.len});
+        for (meta.servers) |sv| {
+            if (sv.last == std.math.maxInt(u64))
+                std.debug.print("     {s}  (all pieces)\n", .{sv.url})
+            else
+                std.debug.print("     {s}  (pieces {d}..{d})\n", .{ sv.url, sv.first, sv.last });
+        }
+
+        // The announce is worth making even against a dead tracker: a live one may hand back
+        // its own set of download servers, which is the one way the URL can change at runtime.
+        if (no_tracker or meta.announce.len == 0) {
+            std.debug.print("6  tracker       skipped\n", .{});
+        } else {
+            const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
+            const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .started);
+            std.debug.print("6  tracker       {s}\n", .{url});
+            if (fetchUrl(gpa, &client, url)) |body| {
+                const r = try legacy.parseAnnounce(gpa, body);
+                if (r.failure) |f| {
+                    std.debug.print("     refused: {s}\n", .{f});
+                } else {
+                    std.debug.print("     {d} peers, {d} servers offered\n", .{ r.peers, r.servers.len });
+                    if (r.servers.len != 0) {
+                        // Tracker-supplied servers go in front: they are the fresher answer.
+                        var all: std.ArrayList(legacy.Server) = .empty;
+                        try all.appendSlice(gpa, r.servers);
+                        try all.appendSlice(gpa, meta.servers);
+                        meta.servers = try all.toOwnedSlice(gpa);
+                        for (r.servers) |sv| std.debug.print("     + {s}\n", .{sv.url});
+                    }
+                }
+            } else |e| {
+                std.debug.print("     no answer ({t}) — this is expected, the trackers are gone\n", .{e});
+            }
+        }
+        std.debug.print("7  pieces\n", .{});
+    }
 
     var b1: [32]u8 = undefined;
     if (std.mem.eql(u8, verb, "info")) {
@@ -214,6 +342,7 @@ pub fn main(init: std.process.Init) !void {
             \\infohash        : {x}
             \\announce        : {s}   (dead since ~2016)
             \\direct download : {s}
+            \\servers         : {d}
             \\piece length    : {d}
             \\pieces          : {d}
             \\files           : {d}
@@ -221,7 +350,7 @@ pub fn main(init: std.process.Init) !void {
             \\
         , .{
             meta.name,       meta.locale, meta.launch_target, meta.infohash,
-            meta.announce,   meta.direct_download,
+            meta.announce,   meta.direct_download, meta.servers.len,
             meta.piece_length, meta.pieceCount(), meta.files.len,
             meta.total,      human(meta.total, &b1),
         });
@@ -280,15 +409,32 @@ pub fn main(init: std.process.Init) !void {
         return if (bad == 0) {} else error.Corrupt;
     }
 
-    if (!std.mem.eql(u8, verb, "fetch")) {
+    if (!std.mem.eql(u8, verb, "fetch") and !std.mem.eql(u8, verb, "run")) {
         std.debug.print("{s}", .{usage});
         return error.Usage;
     }
 
     var done: usize = 0;
     var failed: usize = 0;
-    var p = from;
-    while (p <= last) : (p += 1) {
+
+    // The client does not walk the pieces in order. It builds a vector of candidates, runs
+    // std::random_shuffle over it, then sorts by peer availability with a NON-stable sort, so
+    // the shuffle survives as the tie-break among equal scores. Every Blizzard stub sets
+    // "disable p2p", so there are no peers, every score is equal, and what is left is a fresh
+    // random permutation on each run — which is why the real progress bar fills in scattered
+    // blocks. Matching it matters: a straight 0,1,2,... scan is a visibly different access
+    // pattern to whatever is serving the pieces.
+    const order = try gpa.alloc(usize, last - from + 1);
+    for (order, 0..) |*o, k| o.* = from + k;
+    if (!sequential) {
+        // Seeded from the clock, the same way the client seeds the rand() behind its shuffle,
+        // so consecutive runs do not repeat an order.
+        const now = std.Io.Timestamp.now(init.io, .real);
+        var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(now.nanoseconds))));
+        prng.random().shuffle(usize, order);
+    }
+
+    for (order) |p| {
         const want = meta.pieceSize(p);
         var attempt: usize = 0;
         var last_err: []const u8 = "unknown";
@@ -301,7 +447,9 @@ pub fn main(init: std.process.Init) !void {
                 for (&salt) |*c| c.* = alpha[prng.random().uintLessThan(usize, alpha.len)];
                 break :blk salt[0..];
             };
-            const url = try meta.pieceUrl(gpa, p, s);
+            // Each retry moves to the next server whose range covers this piece, so a mirror
+            // that is down costs one attempt rather than every attempt.
+            const url = try meta.pieceUrlFrom(gpa, p, s, attempt);
             const body = fetchUrl(gpa, &client, url) catch |e| {
                 last_err = if (e == error.HttpStatus)
                     std.fmt.allocPrint(gpa, "HTTP {d}", .{last_status}) catch "HttpStatus"
@@ -339,6 +487,23 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
+
+    if (std.mem.eql(u8, verb, "run")) {
+        // The client announces exactly twice, started and stopped, and the second one claims
+        // the download finished whether it did or not.
+        if (!no_tracker and meta.announce.len != 0) {
+            const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
+            const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .stopped);
+            std.debug.print("8  tracker       event=stopped\n", .{});
+            if (fetchUrl(gpa, &client, url)) |_| {} else |_| {}
+        } else {
+            std.debug.print("8  tracker       skipped\n", .{});
+        }
+        // The client would run this itself. Printing it is as far as this goes: fetching a
+        // payload is one thing, executing it unasked is another.
+        std.debug.print("9  launch target {s}/{s}  (not run)\n", .{ dir_path, meta.launch_target });
+    }
+
     if (failed != 0) return error.Incomplete;
 }
 
@@ -373,13 +538,24 @@ fn resolveStub(
 /// The status of the last failed fetch, so a piece failure can say 403 rather than "HttpStatus".
 var last_status: u16 = 0;
 
+/// Set from the cookieName/cookieData config pair. The client hands these to
+/// InternetSetCookieW rather than writing a header itself, which comes to the same thing on the
+/// wire. Both must be present or neither is sent, exactly as HttpDirect_RequestPiece checks.
+var cookie: ?[]const u8 = null;
+
 fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
     var body: std.Io.Writer.Allocating = .init(gpa);
+    // `Pragma: no-cache` is not the program's doing: the client opens every request with
+    // INTERNET_FLAG_RELOAD, and that is what WinInet puts on the wire for it.
+    const with_cookie = [_]std.http.Header{
+        .{ .name = "Pragma", .value = "no-cache" },
+        .{ .name = "Cookie", .value = cookie orelse "" },
+    };
     const res = try client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
         .headers = .{ .user_agent = .{ .override = legacy.user_agent } },
-        .extra_headers = &.{
+        .extra_headers = if (cookie != null) &with_cookie else &.{
             .{ .name = "Pragma", .value = "no-cache" },
         },
         .response_writer = &body.writer,

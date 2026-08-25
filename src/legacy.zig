@@ -104,6 +104,79 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, at: usize) Error!struct
 
 pub const File = struct { length: u64, path: []const u8 };
 
+/// One HTTP piece source, and the pieces it is allowed to serve.
+///
+/// The downloader keeps a vector of these and picks the first whose range covers the piece it
+/// wants, sticking with a server while its throughput holds up. A plain `direct download` URL
+/// covers everything; a `server list` entry covers only `begin..end`.
+pub const Server = struct {
+    url: []const u8,
+    first: u64 = 0,
+    last: u64 = std.math.maxInt(u64),
+
+    pub fn covers(self: Server, index: usize) bool {
+        return index >= self.first and index <= self.last;
+    }
+};
+
+/// Expand one `direct download` string into every server URL it names.
+///
+/// Faithful to DirectDownload_ExpandServerUrls in the downloader, whose delimiters were read
+/// off the `MOV DL,imm` at each split call site:
+///
+///   * the string splits on `|`, so one entry may name several URLs;
+///   * a URL not starting with `http://`, or with no `[...]` group before the first `/` after
+///     the host, is taken verbatim;
+///   * otherwise the bracket body splits on `,`, each item splits on `-`, and a two-part item
+///     is the inclusive integer range `a..b`;
+///   * each integer N yields `prefix ++ N ++ path`, where `path` starts at the first `/` after
+///     the host — so any host text between `]` and the path is dropped, which means the bracket
+///     is meant to end the hostname.
+///
+/// So `http://dl[1-3,7].example/x` is four servers. None of Blizzard's own stubs use any of
+/// this — every one carries a single bracket-free URL — but the client accepts it, so a mirror
+/// can hand out a whole fleet in one string.
+pub fn expandServerUrls(gpa: std.mem.Allocator, spec: []const u8, out: *std.ArrayList(Server)) !void {
+    var urls = std.mem.splitScalar(u8, spec, '|');
+    while (urls.next()) |url| {
+        if (url.len == 0) continue;
+        if (!std.mem.startsWith(u8, url, "http://")) {
+            try out.append(gpa, .{ .url = url });
+            continue;
+        }
+        // The bracket has to sit in the host, before the path begins.
+        const path_at = std.mem.indexOfScalarPos(u8, url, 8, '/') orelse {
+            try out.append(gpa, .{ .url = url });
+            continue;
+        };
+        const open = std.mem.indexOfScalarPos(u8, url, 8, '[') orelse 0;
+        const close = std.mem.indexOfScalarPos(u8, url, 8, ']') orelse 0;
+        if (open == 0 or close == 0 or open >= path_at or close >= path_at or close < open) {
+            try out.append(gpa, .{ .url = url });
+            continue;
+        }
+
+        const prefix = url[0..open];
+        const path = url[path_at..];
+        var items = std.mem.splitScalar(u8, url[open + 1 .. close], ',');
+        while (items.next()) |item| {
+            var ends = std.mem.splitScalar(u8, item, '-');
+            const a_txt = ends.next() orelse continue;
+            const a = std.fmt.parseInt(u64, a_txt, 10) catch continue;
+            const b = if (ends.next()) |b_txt|
+                std.fmt.parseInt(u64, b_txt, 10) catch a
+            else
+                a;
+            var n = a;
+            while (n <= b) : (n += 1) {
+                try out.append(gpa, .{
+                    .url = try std.fmt.allocPrint(gpa, "{s}{d}{s}", .{ prefix, n, path }),
+                });
+            }
+        }
+    }
+}
+
 pub const Metainfo = struct {
     /// The whole stub, borrowed; every slice below points into it.
     raw: []const u8,
@@ -112,8 +185,11 @@ pub const Metainfo = struct {
     end: usize,
 
     announce: []const u8,
-    /// The HTTP piece source. This is the one that still works.
+    /// The `direct download` value exactly as the torrent carries it, before expansion.
     direct_download: []const u8,
+    /// Every HTTP piece source, in the order the client would consider them: the expansion of
+    /// `direct download` first, then each `server list` entry with its piece range.
+    servers: []Server,
     locale: []const u8,
     launch_target: []const u8,
     name: []const u8,
@@ -136,13 +212,36 @@ pub const Metainfo = struct {
         return @min(self.piece_length, self.total - at);
     }
 
+    /// The base to use for `index`: the first server whose range covers it, which is how the
+    /// client chooses. `attempt` walks past servers already tried, so a piece that fails on one
+    /// mirror is retried on the next rather than hammering the same host.
+    pub fn serverFor(self: Metainfo, index: usize, attempt: usize) ?Server {
+        var seen: usize = 0;
+        for (self.servers) |s| {
+            if (!s.covers(index)) continue;
+            if (seen == attempt) return s;
+            seen += 1;
+        }
+        // Past the end, fall back to the first that covers it.
+        for (self.servers) |s| if (s.covers(index)) return s;
+        return null;
+    }
+
     /// `<base>/<index>`. On a retry the downloader appends `?<shuffled alphabet>` purely to miss
     /// the CDN cache; `salt` reproduces that when a piece comes back corrupt.
     pub fn pieceUrl(self: Metainfo, gpa: std.mem.Allocator, index: usize, salt: ?[]const u8) ![]u8 {
-        return if (salt) |s|
-            std.fmt.allocPrint(gpa, "{s}/{d}?{s}", .{ self.direct_download, index, s })
+        return self.pieceUrlFrom(gpa, index, salt, 0);
+    }
+
+    pub fn pieceUrlFrom(self: Metainfo, gpa: std.mem.Allocator, index: usize, salt: ?[]const u8, attempt: usize) ![]u8 {
+        const base = if (self.serverFor(index, attempt)) |s|
+            std.mem.trimEnd(u8, s.url, "/")
         else
-            std.fmt.allocPrint(gpa, "{s}/{d}", .{ self.direct_download, index });
+            self.direct_download;
+        return if (salt) |s|
+            std.fmt.allocPrint(gpa, "{s}/{d}?{s}", .{ base, index, s })
+        else
+            std.fmt.allocPrint(gpa, "{s}/{d}", .{ base, index });
     }
 
     pub fn verify(self: Metainfo, index: usize, data: []const u8) Error!void {
@@ -231,12 +330,34 @@ pub fn fromStub(gpa: std.mem.Allocator, stub: []const u8) !Metainfo {
             try files.append(gpa, .{ .length = total, .path = info.str_("name") orelse "payload" });
         }
 
+        // Both server sources, in the order the client reads them: the expansion of
+        // `direct download`, covering every piece, then each `server list` entry with the
+        // range it is limited to. An entry missing begin/end/url is skipped, as it is there.
+        const dd = root.str_("direct download") orelse "";
+        var servers: std.ArrayList(Server) = .empty;
+        try expandServerUrls(gpa, dd, &servers);
+        if (root.get("server list")) |sl| {
+            if (sl == .list) {
+                for (sl.list) |e| {
+                    const url = e.str_("url") orelse continue;
+                    const first = e.int_("begin") orelse continue;
+                    const last = e.int_("end") orelse continue;
+                    try servers.append(gpa, .{
+                        .url = url,
+                        .first = @intCast(first),
+                        .last = @intCast(last),
+                    });
+                }
+            }
+        }
+
         return .{
             .raw = exe,
             .at = at,
             .end = r[1],
             .announce = root.str_("announce") orelse "",
-            .direct_download = root.str_("direct download") orelse "",
+            .direct_download = dd,
+            .servers = try servers.toOwnedSlice(gpa),
             .locale = root.str_("locale") orelse "",
             .launch_target = root.str_("launch target") orelse "",
             .name = info.str_("name") orelse "",
@@ -294,6 +415,7 @@ test "bencode round trips the shapes a metainfo uses" {
 test "a piece that is not a whole piece long is the last one" {
     const m: Metainfo = .{
         .raw = "", .at = 0, .end = 0, .announce = "", .direct_download = "http://h/base",
+        .servers = &.{},
         .locale = "", .launch_target = "", .name = "x",
         .piece_length = 100, .pieces = &[_]u8{0} ** 60, .files = &.{}, .total = 250,
         .infohash = undefined,
@@ -307,6 +429,7 @@ test "piece urls are the base plus an index, and a salt only on retry" {
     const gpa = testing.allocator;
     const m: Metainfo = .{
         .raw = "", .at = 0, .end = 0, .announce = "", .direct_download = "http://h/base",
+        .servers = &.{},
         .locale = "", .launch_target = "", .name = "x",
         .piece_length = 100, .pieces = &[_]u8{0} ** 20, .files = &.{}, .total = 100,
         .infohash = undefined,
@@ -317,4 +440,245 @@ test "piece urls are the base plus an index, and a salt only on retry" {
     const b = try m.pieceUrl(gpa, 7, "zqx");
     defer gpa.free(b);
     try testing.expectEqualStrings("http://h/base/7?zqx", b);
+}
+
+test "direct download expands the way the client expands it" {
+    const gpa = testing.allocator;
+
+    // A plain URL is one server, untouched.
+    {
+        var out: std.ArrayList(Server) = .empty;
+        defer out.deinit(gpa);
+        try expandServerUrls(gpa, "http://a.example/p", &out);
+        try testing.expectEqual(@as(usize, 1), out.items.len);
+        try testing.expectEqualStrings("http://a.example/p", out.items[0].url);
+        // and it covers every piece
+        try testing.expect(out.items[0].covers(0));
+        try testing.expect(out.items[0].covers(999_999));
+    }
+
+    // '|' separates whole URLs.
+    {
+        var out: std.ArrayList(Server) = .empty;
+        defer out.deinit(gpa);
+        try expandServerUrls(gpa, "http://a.example/p|http://b.example/q", &out);
+        try testing.expectEqual(@as(usize, 2), out.items.len);
+        try testing.expectEqualStrings("http://b.example/q", out.items[1].url);
+    }
+
+    // A bracket group is a range, a list, or both.
+    {
+        var out: std.ArrayList(Server) = .empty;
+        defer {
+            for (out.items) |s| gpa.free(s.url);
+            out.deinit(gpa);
+        }
+        try expandServerUrls(gpa, "http://dl[1-3,7]/x", &out);
+        try testing.expectEqual(@as(usize, 4), out.items.len);
+        try testing.expectEqualStrings("http://dl1/x", out.items[0].url);
+        try testing.expectEqualStrings("http://dl3/x", out.items[2].url);
+        try testing.expectEqualStrings("http://dl7/x", out.items[3].url);
+    }
+
+    // The client rebuilds the URL as prefix + N + everything from the first '/', so any host
+    // text sitting between ']' and the path is dropped. Quirk, not an accident: the bracket is
+    // meant to end the hostname. Matched here so the behaviour cannot drift apart from it.
+    {
+        var out: std.ArrayList(Server) = .empty;
+        defer {
+            for (out.items) |s| gpa.free(s.url);
+            out.deinit(gpa);
+        }
+        try expandServerUrls(gpa, "http://dl[1-2].example/x", &out);
+        try testing.expectEqual(@as(usize, 2), out.items.len);
+        try testing.expectEqualStrings("http://dl1/x", out.items[0].url);
+    }
+
+    // A bracket after the path starts is not a host group, so the URL is left alone.
+    {
+        var out: std.ArrayList(Server) = .empty;
+        defer out.deinit(gpa);
+        try expandServerUrls(gpa, "http://a.example/p[1-3]", &out);
+        try testing.expectEqual(@as(usize, 1), out.items.len);
+        try testing.expectEqualStrings("http://a.example/p[1-3]", out.items[0].url);
+    }
+}
+
+test "a server only serves the pieces its range covers" {
+    const gpa = testing.allocator;
+    var servers = [_]Server{
+        .{ .url = "http://all.example", .first = 0, .last = std.math.maxInt(u64) },
+        .{ .url = "http://tail.example", .first = 100, .last = 200 },
+    };
+    const m: Metainfo = .{
+        .raw = "",         .at = 0,             .end = 0,
+        .announce = "",    .direct_download = "http://all.example",
+        .servers = &servers,
+        .locale = "",      .launch_target = "", .name = "",
+        .piece_length = 4, .pieces = "",        .files = &.{},
+        .total = 0,        .infohash = undefined,
+    };
+
+    // Attempt 0 is the first server that covers the piece; attempt 1 is the next one.
+    try testing.expectEqualStrings("http://all.example", m.serverFor(150, 0).?.url);
+    try testing.expectEqualStrings("http://tail.example", m.serverFor(150, 1).?.url);
+    // Piece 5 is outside the second server's range, so there is no second choice for it.
+    try testing.expectEqualStrings("http://all.example", m.serverFor(5, 1).?.url);
+
+    const u = try m.pieceUrlFrom(gpa, 150, null, 1);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("http://tail.example/150", u);
+}
+
+// ── tracker ──────────────────────────────────────────────────────────────────────────────────
+
+/// Percent-escape a value for the announce query, escaping everything that is not unreserved.
+/// The info hash and peer id are raw bytes, not text, so this has to be byte-wise.
+pub fn urlEscape(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (raw) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => try out.append(gpa, c),
+        else => try out.print(gpa, "%{X:0>2}", .{c}),
+    };
+    return out.toOwnedSlice(gpa);
+}
+
+pub const Event = enum { started, stopped };
+
+/// The announce URL, built the way Tracker_BuildAnnounceUrl builds it.
+///
+/// Faithful down to the odd parts: the port is the literal "3724" rather than any port this
+/// program listens on, and the progress figures are fixed rather than measured — `started`
+/// always claims nothing done, `stopped` always claims everything done. The client never sends
+/// `event=completed` or `compact=1`; both strings are in the binary with no reference to them.
+pub fn announceUrl(
+    gpa: std.mem.Allocator,
+    announce: []const u8,
+    infohash: [20]u8,
+    peer_id: [20]u8,
+    key: []const u8,
+    event: Event,
+) ![]u8 {
+    const ih = try urlEscape(gpa, &infohash);
+    defer gpa.free(ih);
+    const pid = try urlEscape(gpa, &peer_id);
+    defer gpa.free(pid);
+    const k = try urlEscape(gpa, key);
+    defer gpa.free(k);
+    return std.fmt.allocPrint(gpa, "{s}?info_hash={s}&peer_id={s}&key={s}&port=3724" ++
+        "&uploaded=0&downloaded={d}&left={d}&event={s}", .{
+        announce,
+        ih,
+        pid,
+        k,
+        @as(u8, if (event == .started) 0 else 1),
+        @as(u8, if (event == .started) 1 else 0),
+        @tagName(event),
+    });
+}
+
+/// A 20-byte peer id. The client derives one from a machine identifier and hex-encodes ten
+/// bytes of it, falling back to twenty random bytes in [0x21,0xff] when that lookup fails.
+/// Taking the fallback shape on purpose: it is a real path in the client and it does not put a
+/// machine identifier on the wire.
+pub fn peerId(seed: u64) [20]u8 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var id: [20]u8 = undefined;
+    for (&id) |*c| c.* = prng.random().intRangeAtMost(u8, 0x21, 0xff);
+    return id;
+}
+
+pub const Announce = struct {
+    /// Set when the tracker refused; everything else is meaningless then.
+    failure: ?[]const u8 = null,
+    warning: ?[]const u8 = null,
+    interval: ?i64 = null,
+    peers: usize = 0,
+    /// Servers the tracker handed out, from `direct.url` and `direct."server list"`. This is the
+    /// mechanism by which a live tracker can move the client onto different CDN hosts.
+    servers: []Server = &.{},
+    threshold: ?i64 = null,
+};
+
+/// Parse an announce reply the way Tracker_ParseAnnounceResponse parses it.
+pub fn parseAnnounce(gpa: std.mem.Allocator, body: []const u8) !Announce {
+    if (body.len == 0 or body[0] != 'd') return Error.NoTorrent;
+    const root, _ = try decode(gpa, body, 0);
+
+    var out: Announce = .{
+        .failure = root.str_("failure reason"),
+        .warning = root.str_("warning"),
+        .interval = root.int_("interval"),
+    };
+    if (root.get("peers")) |p| out.peers = switch (p) {
+        .list => p.list.len,
+        .str => p.str.len / 6, // compact form, six bytes per peer
+        else => 0,
+    };
+
+    if (root.get("direct")) |d| {
+        out.threshold = d.int_("threshold");
+        var servers: std.ArrayList(Server) = .empty;
+        if (d.str_("url")) |u| try expandServerUrls(gpa, u, &servers);
+        if (d.get("server list")) |sl| {
+            if (sl == .list) for (sl.list) |e| {
+                const url = e.str_("url") orelse continue;
+                const first = e.int_("begin") orelse continue;
+                const last = e.int_("end") orelse continue;
+                try servers.append(gpa, .{
+                    .url = url,
+                    .first = @intCast(first),
+                    .last = @intCast(last),
+                });
+            };
+        }
+        out.servers = try servers.toOwnedSlice(gpa);
+    }
+    return out;
+}
+
+test "the announce url is built the way the client builds it" {
+    const gpa = testing.allocator;
+    const ih: [20]u8 = .{0xAB} ** 20;
+    const pid: [20]u8 = .{'a'} ** 20;
+    const u = try announceUrl(gpa, "http://t.example/announce", ih, pid, "k1", .started);
+    defer gpa.free(u);
+    try testing.expect(std.mem.startsWith(u8, u, "http://t.example/announce?info_hash=%AB%AB"));
+    try testing.expect(std.mem.indexOf(u8, u, "&peer_id=aaaaaaaaaaaaaaaaaaaa") != null);
+    // The fixed parts: a literal port, and progress that is asserted rather than measured.
+    try testing.expect(std.mem.endsWith(u8, u, "&port=3724&uploaded=0&downloaded=0&left=1&event=started"));
+
+    const v = try announceUrl(gpa, "http://t.example/announce", ih, pid, "k1", .stopped);
+    defer gpa.free(v);
+    try testing.expect(std.mem.endsWith(u8, v, "&downloaded=1&left=0&event=stopped"));
+}
+
+test "a tracker can hand out its own download servers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const body = "d8:intervali1800e6:direct" ++
+        "d9:thresholdi5e3:url23:http://t1/p|http://t2/p" ++
+        "11:server listld5:begini10e3:endi20e3:url9:http://m1eee" ++
+        "5:peersle" ++
+        "e";
+    const r = try parseAnnounce(a, body);
+    try testing.expectEqual(@as(i64, 1800), r.interval.?);
+    try testing.expectEqual(@as(i64, 5), r.threshold.?);
+    // two from the pipe-separated url, one ranged entry from the server list
+    try testing.expectEqual(@as(usize, 3), r.servers.len);
+    try testing.expectEqualStrings("http://t2/p", r.servers[1].url);
+    try testing.expectEqual(@as(u64, 10), r.servers[2].first);
+    try testing.expectEqual(@as(u64, 20), r.servers[2].last);
+}
+
+test "a tracker refusal is reported, not mistaken for success" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const r = try parseAnnounce(arena.allocator(), "d14:failure reason9:no such te");
+    try testing.expectEqualStrings("no such t", r.failure.?);
+    try testing.expectEqual(@as(usize, 0), r.servers.len);
 }

@@ -55,6 +55,38 @@ The trackers are gone. All five regions still have DNS pointing at Blizzard addr
 downloading fine anyway. It falls back to the `direct download` URL, which it treats as just
 another peer, URL where the peer id would go.
 
+### Where the piece URLs come from
+
+`direct download` is not one URL, which is easy to miss because none of Blizzard's own stubs
+use more than one. Traced through `DirectDownload_ExpandServerUrls` in the binary, the string
+splits on `|`, and each URL may carry a bracket group in the host: the body splits on `,`, and
+an item of the form `a-b` is the inclusive range. So
+
+```
+http://dl[1-3,7]/x   ->   http://dl1/x  http://dl2/x  http://dl3/x  http://dl7/x
+```
+
+The rebuilt URL is prefix + N + everything from the first `/`, so host text between `]` and the
+path is dropped — the bracket is meant to end the hostname.
+
+Five things can supply a server, and this is the complete list:
+
+|source|range|
+|-|-|
+|torrent `direct download`, expanded|every piece|
+|torrent `server list` `[{begin,end,url}]`|`begin..end`|
+|tracker announce reply, `direct.url`, expanded|every piece|
+|tracker announce reply, `direct."server list"`|`begin..end`|
+|config `directDownloadURL`|overrides the base|
+
+The tracker one matters more than it looks: a live tracker could move the client onto entirely
+different CDN hosts without the stub changing. All five are dead ends for these stubs — every
+one of the 44 carries a single bracket-free URL and no `server list`, and the trackers stopped
+answering around 2016 — but the client accepts all of it, so `--base` does too.
+
+The client keeps whichever server it is on while that server's throughput stays at or above
+4000000, then re-picks among those whose range covers the wanted piece.
+
 That HTTP source serves one numbered file per piece:
 
 ```
@@ -129,6 +161,65 @@ Then, on the machine running the downloader, Internet Options -> Connections -> 
 proxy, pointed at whatever host is running it. No administrator rights and no hosts file. HTTPS
 is tunnelled through CONNECT and stays unreadable, which is fine — none of this is HTTPS.
 
+## The whole sequence
+
+`run` does what the client does, in the client's order, with no window:
+
+```
+blizzard-legacy-dl run D2XP -o ./out
+```
+
+```
+1  stub          the embedded torrent
+2  metainfo      name, infohash, pieces, files
+3  config        --ini, in BlizzardDownloader.ini format
+4  server config <host>/update/Downloader.ini, only with --server-config
+5  servers       every URL, with the piece range each may serve
+6  tracker       announce event=started, and merge any servers it hands back
+7  pieces        fetch, verify, assemble
+8  tracker       announce event=stopped
+9  launch target printed, never run
+```
+
+Step 4 is the hardcoded `http://12.129.222.52/update/Downloader.ini` the real client asks for
+before it transfers anything. That address has been dead for years and nothing recovers from
+it — the client just waits out the connect timeout, which is most of the pause on startup. It
+is off by default here for that reason.
+
+The announce in steps 6 and 8 is built exactly as `Tracker_BuildAnnounceUrl` builds it:
+
+```
+?info_hash=..&peer_id=..&key=..&port=3724&uploaded=0&downloaded=0&left=1&event=started
+```
+
+The port is the literal string `3724` rather than any port the program listens on, and the
+progress figures are asserted rather than measured — `started` always claims nothing is done,
+`stopped` always claims everything is. The client sends only those two events; `&compact=1` and
+`&event=completed` are in the binary with nothing referencing them.
+
+### Piece order is not sequential
+
+The client builds a vector of `{piece, availability}` pairs, runs `std::random_shuffle` over it,
+then sorts by availability with a **non-stable** sort, so the shuffle survives as the tie-break
+among equal scores. That is rarest-first with a random tie-break — but every one of these
+torrents sets `disable p2p`, so there are no peers, every score is equal, and what is left is a
+fresh random permutation on each run. It is why the real progress bar fills in scattered blocks
+rather than left to right.
+
+`run` and `fetch` do the same. `--sequential` turns it off.
+
+### http or https
+
+Whichever the URL says. `HttpWinInet_SendRequest` always passes
+`RELOAD | NO_CACHE_WRITE | NO_UI`, and adds `INTERNET_FLAG_SECURE` when the cracked URL's scheme
+is `INTERNET_SCHEME_HTTPS`; the port comes from the URL too. So `https://` and non-default ports
+work — Blizzard simply never used them, so in practice every request these stubs make is
+plaintext HTTP on port 80. A mirror given to `--base` may be either.
+
+Two details of the real request that a wine capture will not show you, because wine's WinInet is
+its own reimplementation: `acceptTypes` is NULL, so genuine WinInet sends **no** `Accept` header,
+and `RELOAD` is what puts `Pragma: no-cache` on the wire rather than the program setting it.
+
 ## Commands
 
 ```
@@ -140,6 +231,8 @@ fetch   <stub> [-o dir]            fetch every piece, verify it, assemble
         [--from n] [--to n] [--retries n] [--base url]
 verify  <stub> [-o dir]            re-check an assembled payload piece by piece
 proxy   [--port n]                 watch what the real downloader sends, verbatim
+run     <stub> [-o dir]            the whole client sequence, headless
+        [--ini f] [--server-config url] [--no-tracker] [--sequential]
 ```
 
 `<stub>` is a product code (`D2XP`), a downloader `.exe`, a Mac `.zip`, or a plain `.torrent`.
