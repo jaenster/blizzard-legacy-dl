@@ -24,6 +24,7 @@ const usage =
     \\  --to <n>     last piece, inclusive (default: the last one)
     \\  --retries <n>  per-piece retries before giving up (default 3)
     \\  --base <url> fetch pieces from a mirror instead of the (dead) Blizzard host
+    \\  --jobs <n>     pieces to fetch at once (default 4)
     \\  --sequential   fetch pieces in order; the client shuffles them, and so do we
     \\  --cookie <v>   override the CDN access token taken from the stub
     \\
@@ -139,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
     var server_config: ?[]const u8 = null;
     var no_tracker = false;
     var sequential = false;
+    var jobs: usize = 4;
     var cookie_override: ?[]const u8 = null;
     var i: usize = 3;
     while (i < argv.len) : (i += 1) {
@@ -163,6 +165,9 @@ pub fn main(init: std.process.Init) !void {
             server_config = argv[i];
         } else if (std.mem.eql(u8, a, "--no-tracker")) {
             no_tracker = true;
+        } else if (std.mem.eql(u8, a, "--jobs") and i + 1 < argv.len) {
+            i += 1;
+            jobs = @max(1, try std.fmt.parseInt(usize, argv[i], 10));
         } else if (std.mem.eql(u8, a, "--sequential")) {
             sequential = true;
         } else if (std.mem.eql(u8, a, "--cookie") and i + 1 < argv.len) {
@@ -459,83 +464,41 @@ pub fn main(init: std.process.Init) !void {
     const tty = (std.Io.File.stderr().isTty(init.io) catch false);
     var grid: ?Grid = if (tty) try Grid.init(gpa, init.io, last - from + 1) else null;
 
-    for (order) |p| {
-        _ = scratch_state.reset(.retain_capacity);
-        const scratch = scratch_state.allocator();
-        const want = meta.pieceSize(p);
+    // Several pieces at once. The real client does the same, governed by its maxpending and
+    // maxsimultaneous settings; neither it nor this caps the download rate itself.
+    var shared: Fetch = .{
+        .meta = meta,
+        .order = order,
+        .from = from,
+        .last = last,
+        .dest = dest,
+        .retries = retries,
+        .grid = if (grid) |*g| g else null,
+    };
 
-        // Anything already on disk and matching its hash is left alone, so an interrupted
-        // fetch resumes instead of downloading what it already has.
-        if (readPiece(meta, scratch, init.io, dest, p, try scratch.alloc(u8, want))) |have| {
-            if (meta.verify(p, have)) |_| {
-                done += 1;
-                resumed += 1;
-                if (grid) |*g| {
-                    g.mark(p - from, true);
-                    g.draw(done, failed, false);
-                }
-                continue;
-            } else |_| {}
-        } else |_| {}
-
-        var attempt: usize = 0;
-        var last_err: []const u8 = "unknown";
-        const ok = while (attempt <= retries) : (attempt += 1) {
-            // The salt is the downloader's own cache-buster, used only after a bad piece.
-            var salt: [12]u8 = undefined;
-            const s: ?[]const u8 = if (attempt == 0) null else blk: {
-                const alpha = "abcdefghijklmnopqrstuvwxyz1234567890";
-                var prng = std.Random.DefaultPrng.init(@as(u64, p) *% 1000003 +% attempt);
-                for (&salt) |*c| c.* = alpha[prng.random().uintLessThan(usize, alpha.len)];
-                break :blk salt[0..];
-            };
-            // Each retry moves to the next server whose range covers this piece, so a mirror
-            // that is down costs one attempt rather than every attempt.
-            const url = try meta.pieceUrlFrom(scratch, p, s, attempt);
-            const body = fetchUrl(scratch, &client, url) catch |e| {
-                last_err = if (e == error.HttpStatus)
-                    std.fmt.allocPrint(gpa, "HTTP {d}", .{last_status}) catch "HttpStatus"
-                else
-                    @errorName(e);
-                continue;
-            };
-            if (body.len != want) {
-                last_err = "short read";
-                continue;
-            }
-            meta.verify(p, body) catch {
-                last_err = "hash mismatch";
-                continue;
-            };
-            try writePiece(meta, scratch, init.io, dest, p, body);
-            break true;
-        } else false;
-
-        if (ok) {
-            done += 1;
-            if (grid) |*g| {
-                g.mark(p - from, true);
-                g.draw(done, failed, false);
-            } else if (done % 25 == 0 or p == last) {
-                std.debug.print("\r  {d}/{d} pieces", .{ done, last - from + 1 });
-            }
-        } else {
-            failed += 1;
-            if (grid) |*g| {
-                g.mark(p - from, false);
-                g.draw(done, failed, true);
-            }
-            std.debug.print("\n  piece {d}: {s} after {d} tries — {s}\n", .{ p, last_err, retries + 1, try meta.pieceUrl(gpa, p, null) });
-            // One failure is a blip; a wall of them is the CDN refusing this client, and
-            // grinding through thousands of pieces to learn that helps nobody.
-            if (failed >= 8 and done == 0) {
-                std.debug.print("\n{d} pieces failed in a row, none succeeded — last error: {s}.\n" ++
-                    "A 403 here means the CDN is refusing this machine rather than anything being\n" ++
-                    "wrong with the request; see the README.\n", .{ failed, last_err });
-                return error.AllPiecesFailed;
-            }
+    {
+        const workers = try gpa.alloc(std.Thread, jobs);
+        defer gpa.free(workers);
+        var spawned: usize = 0;
+        for (workers) |*t| {
+            t.* = std.Thread.spawn(.{}, Fetch.work, .{&shared}) catch break;
+            spawned += 1;
         }
+        // If no thread could start, do the work here rather than silently finishing early.
+        if (spawned == 0) Fetch.work(&shared) else for (workers[0..spawned]) |t| t.join();
     }
+
+    done = shared.done;
+    failed = shared.failed;
+    resumed = shared.resumed;
+    if (shared.gave_up) {
+        if (grid) |*g| g.draw(done, failed, true);
+        std.debug.print("\n{d} pieces failed and none succeeded.\n" ++
+            "A 403 here usually means the stub's access token has expired; fetch a fresh\n" ++
+            "stub by asking for the product code, or pass --cookie. See the README.\n", .{failed});
+        return error.AllPiecesFailed;
+    }
+
     if (grid) |*g| g.draw(done, failed, true);
     if (resumed != 0)
         std.debug.print("\n{d} pieces written, {d} already had, {d} failed -> {s}/{s}\n", .{ done - resumed, resumed, failed, dir_path, meta.name })
@@ -577,6 +540,7 @@ const Grid = struct {
     total: usize,
     drawn: bool = false,
     last_draw: i128 = 0,
+    drawing: std.atomic.Value(bool) = .init(false),
     io: std.Io,
 
     fn init(gpa: std.mem.Allocator, io: std.Io, pieces: usize) !Grid {
@@ -607,12 +571,17 @@ const Grid = struct {
 
     fn mark(g: *Grid, piece: usize, ok: bool) void {
         const c = g.cell(piece);
-        if (ok) g.have[c] += 1 else g.bad[c] += 1;
+        _ = @atomicRmw(u32, if (ok) &g.have[c] else &g.bad[c], .Add, 1, .monotonic);
     }
 
     /// Redraw in place, at most a dozen times a second — often enough to look alive, rarely
     /// enough not to drown a slow terminal.
     fn draw(g: *Grid, done: usize, failed: usize, force: bool) void {
+        // Whoever gets here first draws; the others carry on downloading rather than queue up
+        // behind a terminal. At a dozen frames a second nobody misses the skipped ones.
+        if (g.drawing.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return;
+        defer g.drawing.store(false, .release);
+
         const now = std.Io.Timestamp.now(g.io, .real).nanoseconds;
         if (!force and now - g.last_draw < 80 * std.time.ns_per_ms) return;
         g.last_draw = now;
@@ -653,6 +622,132 @@ const Grid = struct {
     }
 };
 
+
+/// The shared state a set of fetch workers pulls from. Counters are atomic and the piece cursor
+/// is a fetch-and-add, so a worker only ever needs the next index and never waits on the others.
+const Fetch = struct {
+    meta: legacy.Metainfo,
+    order: []const usize,
+    from: usize,
+    last: usize,
+    dest: []const u8,
+    retries: usize,
+    grid: ?*Grid,
+
+    cursor: usize = 0,
+    done: usize = 0,
+    failed: usize = 0,
+    resumed: usize = 0,
+    gave_up: bool = false,
+
+    fn take(f: *Fetch) ?usize {
+        const i = @atomicRmw(usize, &f.cursor, .Add, 1, .monotonic);
+        if (i >= f.order.len) return null;
+        return f.order[i];
+    }
+
+    fn work(f: *Fetch) void {
+        // Everything here is this thread's own: its allocator, its Io and its HTTP client.
+        // An arena is not shared safely, and neither is the process-wide Io.
+        // The client and the Io outlive every piece, so they must NOT come from the arena that
+        // gets reset per piece - resetting it would pull their memory out from under them.
+        const stable = std.heap.page_allocator;
+        var threaded: std.Io.Threaded = .init(stable, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var client: std.http.Client = .{ .allocator = stable, .io = io };
+        defer client.deinit();
+
+        var scratch_state = std.heap.ArenaAllocator.init(stable);
+        defer scratch_state.deinit();
+
+        while (f.take()) |p| {
+            if (@atomicLoad(bool, &f.gave_up, .monotonic)) return;
+            _ = scratch_state.reset(.retain_capacity);
+            const scratch = scratch_state.allocator();
+            const want = f.meta.pieceSize(p);
+
+            // Anything already on disk and matching its hash is left alone, so an interrupted
+            // fetch resumes instead of downloading what it already has.
+            if (scratch.alloc(u8, want)) |buf| {
+                if (readPiece(f.meta, scratch, io, f.dest, p, buf)) |have| {
+                    if (f.meta.verify(p, have)) |_| {
+                        _ = @atomicRmw(usize, &f.resumed, .Add, 1, .monotonic);
+                        f.finish(p, true, io);
+                        continue;
+                    } else |_| {}
+                } else |_| {}
+            } else |_| {}
+
+            var attempt: usize = 0;
+            var last_err: []const u8 = "unknown";
+            const ok = while (attempt <= f.retries) : (attempt += 1) {
+                // The salt is the downloader's own cache-buster, used only after a bad piece.
+                var salt: [12]u8 = undefined;
+                const s: ?[]const u8 = if (attempt == 0) null else blk: {
+                    const alpha = "abcdefghijklmnopqrstuvwxyz1234567890";
+                    var prng = std.Random.DefaultPrng.init(@as(u64, p) *% 1000003 +% attempt);
+                    for (&salt) |*c| c.* = alpha[prng.random().uintLessThan(usize, alpha.len)];
+                    break :blk salt[0..];
+                };
+                // Each retry moves to the next server whose range covers this piece, so a
+                // mirror that is down costs one attempt rather than every attempt.
+                const url = f.meta.pieceUrlFrom(scratch, p, s, attempt) catch continue;
+                const body = fetchUrl(scratch, &client, url) catch |e| {
+                    last_err = if (e == error.HttpStatus)
+                        std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
+                    else
+                        @errorName(e);
+                    continue;
+                };
+                if (body.len != want) {
+                    last_err = "short read";
+                    continue;
+                }
+                f.meta.verify(p, body) catch {
+                    last_err = "hash mismatch";
+                    continue;
+                };
+                writePiece(f.meta, scratch, io, f.dest, p, body) catch |e| {
+                    last_err = @errorName(e);
+                    continue;
+                };
+                break true;
+            } else false;
+
+            f.finish(p, ok, io);
+            if (!ok) {
+                std.debug.print("\n  piece {d}: {s} after {d} tries\n", .{ p, last_err, f.retries + 1 });
+                // One failure is a blip; a wall of them with nothing succeeding means the CDN
+                // is refusing us, and grinding through thousands of pieces to learn that
+                // helps nobody.
+                if (@atomicLoad(usize, &f.failed, .monotonic) >= 8 and
+                    @atomicLoad(usize, &f.done, .monotonic) == 0)
+                {
+                    @atomicStore(bool, &f.gave_up, true, .monotonic);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn finish(f: *Fetch, piece: usize, ok: bool, io: std.Io) void {
+        if (ok) _ = @atomicRmw(usize, &f.done, .Add, 1, .monotonic)
+        else _ = @atomicRmw(usize, &f.failed, .Add, 1, .monotonic);
+
+        const done = @atomicLoad(usize, &f.done, .monotonic);
+        const failed = @atomicLoad(usize, &f.failed, .monotonic);
+        if (f.grid) |g| {
+            g.mark(piece - f.from, ok);
+            g.io = io;
+            g.draw(done, failed, !ok);
+        } else if (done % 25 == 0 or piece == f.last) {
+            std.debug.print("\r  {d}/{d} pieces", .{ done, f.order.len });
+        }
+    }
+};
+
 /// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
 fn resolveStub(
     gpa: std.mem.Allocator,
@@ -682,7 +777,7 @@ fn resolveStub(
 }
 
 /// The status of the last failed fetch, so a piece failure can say 403 rather than "HttpStatus".
-var last_status: u16 = 0;
+threadlocal var last_status: u16 = 0;
 
 // The CDN access token, sent as a Cookie on every piece request.
 var cookie: ?[]const u8 = null;

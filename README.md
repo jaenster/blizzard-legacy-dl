@@ -66,6 +66,14 @@ docker run --rm -v "$PWD:/data" ghcr.io/jaenster/blizzard-legacy-dl fetch D2XP -
 Interrupted downloads resume: rerun the same command and every piece already on disk that
 matches its hash is left alone, so only what is missing gets fetched.
 
+Pieces are fetched several at a time — `--jobs`, four by default. On a home connection eight is
+roughly three and a half times faster than one. Blizzard's own client does the same, and neither
+it nor this limits the download rate; only the number of requests in flight.
+
+On a terminal, progress is drawn as a piece map: one cell per run of pieces, shading in as they
+arrive and turning green when a cell is complete. Because pieces are fetched in random order it
+fills scattered rather than left to right. Piped or in CI it falls back to a plain counter.
+
 Products are `D2DV` (Diablo II), `D2XP` (Lord of Destruction), `STAR` (StarCraft),
 `WAR3` (Reign of Chaos) and `W3XP` (The Frozen Throne). `--os` is `WIN` or `MAC`.
 
