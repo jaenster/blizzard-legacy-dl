@@ -17,7 +17,7 @@ const usage =
     \\  fetch   <stub> [-o dir] [opts]     fetch, verify and assemble the payload
     \\  verify  <stub> [-o dir]            re-verify an assembled payload
     \\  run     <stub> [-o dir] [opts]     the whole downloader sequence, headless
-    \\  proxy   [--port n]                 watch what the real downloader sends, verbatim
+    \\  proxy   [--port n] [--bind ip]     watch what the real downloader sends, verbatim
     \\
     \\fetch options:
     \\  --from <n>   first piece (default 0)
@@ -32,7 +32,7 @@ const usage =
     \\  --server-config <url> also ask a host for /update/Downloader.ini, as the client does
     \\  --no-tracker          skip the announce
     \\
-    \\<stub> is a downloader .exe, a Mac .app binary, a .torrent — or just a product code,
+    \\<stub> is a downloader .exe, a Mac .zip, a .torrent — or just a product code,
     \\which is fetched from Blizzard on the spot:
     \\
     \\  blizzard-legacy-dl info d2xp
@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
     var argv_list: std.ArrayList([]const u8) = .empty;
     for (argv_z) |a| try argv_list.append(gpa, std.mem.sliceTo(a, 0));
     const argv = argv_list.items;
-    if (argv.len < 3) {
+    if (argv.len < 2) {
         std.debug.print(usage, .{});
         return error.Usage;
     }
@@ -189,14 +189,21 @@ pub fn main(init: std.process.Init) !void {
     // of reading the disassembly would reveal. See src/proxy.zig.
     if (std.mem.eql(u8, verb, "proxy")) {
         var port: u16 = 8888;
+        // Loopback by default: binding every interface turns this into an open relay for
+        // whoever else is on the network. Another machine needs --bind 0.0.0.0.
+        var bind_addr: [4]u8 = .{ 127, 0, 0, 1 };
         var k: usize = 2;
         while (k < argv.len) : (k += 1) {
             if (std.mem.eql(u8, argv[k], "--port") and k + 1 < argv.len) {
                 k += 1;
                 port = try std.fmt.parseInt(u16, argv[k], 10);
+            } else if (std.mem.eql(u8, argv[k], "--bind") and k + 1 < argv.len) {
+                k += 1;
+                var it = std.mem.splitScalar(u8, argv[k], '.');
+                for (&bind_addr) |*o| o.* = std.fmt.parseInt(u8, it.next() orelse "0", 10) catch 0;
             }
         }
-        return proxy.run(port);
+        return proxy.run(bind_addr, port);
     }
 
     // `stubs` needs no stub of its own, so it runs before we go looking for one.
@@ -222,6 +229,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (argv.len < 3) {
+        std.debug.print(usage, .{});
+        return error.Usage;
+    }
     const stub = try resolveStub(gpa, init.io, &client, argv[2], locale, os_);
     var meta = try legacy.fromStub(gpa, stub);
 
@@ -408,7 +419,7 @@ pub fn main(init: std.process.Init) !void {
         var p = from;
         while (p <= last) : (p += 1) {
             const want = meta.pieceSize(p);
-            const got = try readPiece(meta, gpa, init.io, dest, p, buf[0..want]);
+            const got = readPiece(meta, gpa, init.io, dest, p, buf[0..want]) catch "";
             meta.verify(p, got) catch {
                 bad += 1;
                 std.debug.print("  piece {d}: BAD\n", .{p});
@@ -425,6 +436,7 @@ pub fn main(init: std.process.Init) !void {
 
     var done: usize = 0;
     var failed: usize = 0;
+    var resumed: usize = 0;
 
     // Pieces are fetched in a random order rather than 0,1,2,... — that is what the CDN
     // expects to see, and it spreads a resumed download instead of replaying one region.
@@ -438,8 +450,34 @@ pub fn main(init: std.process.Init) !void {
         prng.random().shuffle(usize, order);
     }
 
+    // Each piece allocates a body, a URL and a span list. Without a reset they accumulate to
+    // the size of the payload, which for these is well over a gigabyte.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+
+    // The map only makes sense on a terminal; piped or in CI it would be a wall of escapes.
+    const tty = (std.Io.File.stderr().isTty(init.io) catch false);
+    var grid: ?Grid = if (tty) try Grid.init(gpa, init.io, last - from + 1) else null;
+
     for (order) |p| {
+        _ = scratch_state.reset(.retain_capacity);
+        const scratch = scratch_state.allocator();
         const want = meta.pieceSize(p);
+
+        // Anything already on disk and matching its hash is left alone, so an interrupted
+        // fetch resumes instead of downloading what it already has.
+        if (readPiece(meta, scratch, init.io, dest, p, try scratch.alloc(u8, want))) |have| {
+            if (meta.verify(p, have)) |_| {
+                done += 1;
+                resumed += 1;
+                if (grid) |*g| {
+                    g.mark(p - from, true);
+                    g.draw(done, failed, false);
+                }
+                continue;
+            } else |_| {}
+        } else |_| {}
+
         var attempt: usize = 0;
         var last_err: []const u8 = "unknown";
         const ok = while (attempt <= retries) : (attempt += 1) {
@@ -453,8 +491,8 @@ pub fn main(init: std.process.Init) !void {
             };
             // Each retry moves to the next server whose range covers this piece, so a mirror
             // that is down costs one attempt rather than every attempt.
-            const url = try meta.pieceUrlFrom(gpa, p, s, attempt);
-            const body = fetchUrl(gpa, &client, url) catch |e| {
+            const url = try meta.pieceUrlFrom(scratch, p, s, attempt);
+            const body = fetchUrl(scratch, &client, url) catch |e| {
                 last_err = if (e == error.HttpStatus)
                     std.fmt.allocPrint(gpa, "HTTP {d}", .{last_status}) catch "HttpStatus"
                 else
@@ -469,16 +507,24 @@ pub fn main(init: std.process.Init) !void {
                 last_err = "hash mismatch";
                 continue;
             };
-            try writePiece(meta, gpa, init.io, dest, p, body);
+            try writePiece(meta, scratch, init.io, dest, p, body);
             break true;
         } else false;
 
         if (ok) {
             done += 1;
-            if (done % 25 == 0 or p == last)
+            if (grid) |*g| {
+                g.mark(p - from, true);
+                g.draw(done, failed, false);
+            } else if (done % 25 == 0 or p == last) {
                 std.debug.print("\r  {d}/{d} pieces", .{ done, last - from + 1 });
+            }
         } else {
             failed += 1;
+            if (grid) |*g| {
+                g.mark(p - from, false);
+                g.draw(done, failed, true);
+            }
             std.debug.print("\n  piece {d}: {s} after {d} tries — {s}\n", .{ p, last_err, retries + 1, try meta.pieceUrl(gpa, p, null) });
             // One failure is a blip; a wall of them is the CDN refusing this client, and
             // grinding through thousands of pieces to learn that helps nobody.
@@ -490,7 +536,11 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-    std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
+    if (grid) |*g| g.draw(done, failed, true);
+    if (resumed != 0)
+        std.debug.print("\n{d} pieces written, {d} already had, {d} failed -> {s}/{s}\n", .{ done - resumed, resumed, failed, dir_path, meta.name })
+    else
+        std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
 
     if (std.mem.eql(u8, verb, "run")) {
         // The client announces exactly twice, started and stopped, and the second one claims
@@ -510,6 +560,98 @@ pub fn main(init: std.process.Init) !void {
 
     if (failed != 0) return error.Incomplete;
 }
+
+
+/// A piece map, the way a torrent client draws one: a grid of cells, each standing for a run of
+/// pieces, filling in as they arrive. Because pieces are fetched in a random order the map fills
+/// scattered rather than left to right, which is what the real downloader looked like.
+const Grid = struct {
+    const shades = [_][]const u8{ " ", "\u{2591}", "\u{2592}", "\u{2593}", "\u{2588}" };
+
+    cols: usize,
+    rows: usize,
+    per_cell: usize,
+    have: []u32,
+    cap: []u32,
+    bad: []u32,
+    total: usize,
+    drawn: bool = false,
+    last_draw: i128 = 0,
+    io: std.Io,
+
+    fn init(gpa: std.mem.Allocator, io: std.Io, pieces: usize) !Grid {
+        const cols: usize = 64;
+        const rows: usize = @min(8, (pieces + cols - 1) / cols);
+        const cells = @max(1, cols * rows);
+        const per = (pieces + cells - 1) / cells;
+        var g: Grid = .{
+            .cols = cols,
+            .rows = rows,
+            .per_cell = @max(1, per),
+            .have = try gpa.alloc(u32, cells),
+            .cap = try gpa.alloc(u32, cells),
+            .bad = try gpa.alloc(u32, cells),
+            .total = pieces,
+            .io = io,
+        };
+        @memset(g.have, 0);
+        @memset(g.bad, 0);
+        @memset(g.cap, 0);
+        for (0..pieces) |i| g.cap[@min(cells - 1, i / g.per_cell)] += 1;
+        return g;
+    }
+
+    fn cell(g: *Grid, piece: usize) usize {
+        return @min(g.have.len - 1, piece / g.per_cell);
+    }
+
+    fn mark(g: *Grid, piece: usize, ok: bool) void {
+        const c = g.cell(piece);
+        if (ok) g.have[c] += 1 else g.bad[c] += 1;
+    }
+
+    /// Redraw in place, at most a dozen times a second — often enough to look alive, rarely
+    /// enough not to drown a slow terminal.
+    fn draw(g: *Grid, done: usize, failed: usize, force: bool) void {
+        const now = std.Io.Timestamp.now(g.io, .real).nanoseconds;
+        if (!force and now - g.last_draw < 80 * std.time.ns_per_ms) return;
+        g.last_draw = now;
+
+        var out: [8 * 1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        if (g.drawn) w.print("\x1b[{d}A", .{g.rows + 2}) catch return;
+        g.drawn = true;
+
+        for (0..g.rows) |r| {
+            w.writeAll("  ") catch return;
+            for (0..g.cols) |c| {
+                const i = r * g.cols + c;
+                if (i >= g.have.len) break;
+                const capacity = g.cap[i];
+                if (capacity == 0) {
+                    w.writeAll(" ") catch return;
+                    continue;
+                }
+                if (g.bad[i] != 0 and g.have[i] < capacity) {
+                    w.writeAll("\x1b[31m\u{2593}\x1b[0m") catch return;
+                    continue;
+                }
+                const level = (g.have[i] * (shades.len - 1) + capacity - 1) / capacity;
+                if (level >= shades.len - 1) {
+                    w.print("\x1b[32m{s}\x1b[0m", .{shades[shades.len - 1]}) catch return;
+                } else {
+                    w.writeAll(shades[level]) catch return;
+                }
+            }
+            w.writeAll("\x1b[K\n") catch return;
+        }
+        const pct = if (g.total == 0) 100 else done * 100 / g.total;
+        w.print("\n  {d}/{d} pieces  {d}%", .{ done, g.total, pct }) catch return;
+        if (failed != 0) w.print("  \x1b[31m{d} failed\x1b[0m", .{failed}) catch return;
+        w.writeAll("\x1b[K\n") catch return;
+        std.debug.print("{s}", .{w.buffered()});
+    }
+};
 
 /// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
 fn resolveStub(

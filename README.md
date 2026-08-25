@@ -1,5 +1,7 @@
 # blizzard-legacy-dl
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/MHK2Dg9)
+
 Downloads the legacy Blizzard games — Diablo II, StarCraft, Warcraft III — from Blizzard's own
 servers, without running their downloader.
 
@@ -61,11 +63,18 @@ Docker takes the same arguments:
 docker run --rm -v "$PWD:/data" ghcr.io/jaenster/blizzard-legacy-dl fetch D2XP -o /data
 ```
 
-Interrupted downloads resume: run the same command again and it fetches only what is missing.
+Interrupted downloads resume: rerun the same command and every piece already on disk that
+matches its hash is left alone, so only what is missing gets fetched.
 
 Products are `D2DV` (Diablo II), `D2XP` (Lord of Destruction), `STAR` (StarCraft),
-`WAR3` (Reign of Chaos) and `W3XP` (The Frozen Throne). `--locale` defaults to `en-US`;
-D2 also has `en-GB de-DE es-ES fr-FR it-IT ko-KR pl-PL zh-TW`. `--os` is `WIN` or `MAC`.
+`WAR3` (Reign of Chaos) and `W3XP` (The Frozen Throne). `--os` is `WIN` or `MAC`.
+
+`--locale` defaults to `en-US`. Which ones exist varies per product — `stubs` walks
+`en-US en-GB de-DE es-ES es-MX fr-FR it-IT ja-JP ko-KR pl-PL pt-BR ru-RU zh-CN zh-TW` and keeps
+whatever answers.
+
+`-o` defaults to the current directory, and the payload always lands in a subdirectory named
+after the torrent (`D2LOD-1.14b-Installer-enUS` and so on), so nothing is strewn about.
 
 A downloader `.exe` you already have works in place of the code, as does a plain `.torrent`.
 
@@ -83,6 +92,9 @@ proxy   [--port n]                 log HTTP requests passing through, and forwar
 Options: `--from n` `--to n` fetch a piece range, `--retries n`, `--base <url>` use a mirror,
 `--cookie <v>` override the access token, `--sequential` fetch in order instead of shuffled,
 `--ini <file>` read config, `--no-tracker` skip the announce.
+
+`proxy` listens on loopback; pass `--bind 0.0.0.0` to point another machine at it, which makes
+it an open relay for anything else on that network for as long as it runs.
 
 Files are preallocated at full length, then each piece is written where it lands, so a fetch
 resumes and does not care about order. `verify` is useful on its own against a copy you got
@@ -117,3 +129,12 @@ four servers. A `server list` entry serves only the piece range it names. The tr
 answers, can supply more. `--base` accepts the same syntax.
 
 Pieces are fetched in a random order rather than sequentially. `--sequential` turns that off.
+
+## See also
+
+[**d2r-cdn**](https://github.com/jaenster/d2r-cdn) — the same idea for the modern games. Diablo II:
+Resurrected and everything else current is distributed over NGDP/TACT/CASC, a completely different
+system to the piece-numbered HTTP source these legacy stubs use, so it is a separate tool.
+
+Between them: `d2r-cdn` for anything Blizzard still ships through the modern CDN, this for the
+last legacy builds of Diablo II, StarCraft and Warcraft III.

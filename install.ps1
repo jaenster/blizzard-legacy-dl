@@ -6,7 +6,8 @@
 # -Version pins a release instead of taking the latest.
 param(
   [string]$Dir = "$env:LOCALAPPDATA\Programs\blizzard-legacy-dl",
-  [string]$Version = "latest"
+  [string]$Version = "latest",
+  [switch]$SkipChecksum
 )
 $ErrorActionPreference = "Stop"
 
@@ -23,19 +24,33 @@ $base = if ($Version -eq "latest") {
 
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $out = Join-Path $Dir "blizzard-legacy-dl.exe"
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
 Write-Host "downloading $asset"
-Invoke-WebRequest -Uri "$base/$asset" -OutFile $out
+Invoke-WebRequest -Uri "$base/$asset" -OutFile $tmp
 
-# Check against the published SHA256SUMS when it is available.
+# Fetching the sums may fail; a MISMATCH may not. Only the fetch is inside the try.
+$want = $null
 try {
   $sums = (Invoke-WebRequest -Uri "$base/SHA256SUMS").Content
-  $want = ($sums -split "`n" | Where-Object { $_ -match [regex]::Escape($asset) }) -split '\s+' | Select-Object -First 1
-  if ($want) {
-    $got = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLower()
-    if ($want.ToLower() -ne $got) { throw "checksum mismatch for $asset" }
-    Write-Host "checksum ok"
+  $line = ($sums -split "`n") | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1
+  if ($line) { $want = ($line -split '\s+')[0] }
+} catch { }
+
+if ($SkipChecksum) {
+  Write-Host "skipping checksum verification (-SkipChecksum)"
+  Move-Item -Force $tmp $out
+} elseif ($want) {
+  $got = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower()
+  if ($want.ToLower() -ne $got) {
+    Remove-Item $tmp -Force
+    throw "checksum mismatch for $asset (expected $want, got $got)"
   }
-} catch { Write-Host "note: could not verify checksum" }
+  Write-Host "checksum ok"
+  Move-Item -Force $tmp $out
+} else {
+  Remove-Item $tmp -Force
+  throw "could not read SHA256SUMS for $asset; refusing to install unverified. Set -SkipChecksum to override."
+}
 
 $user = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($user -notlike "*$Dir*") {

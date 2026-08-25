@@ -237,6 +237,7 @@ pub const Metainfo = struct {
     /// The last piece is short whenever the payload is not a whole multiple of the piece size.
     pub fn pieceSize(self: Metainfo, index: usize) u64 {
         const at = @as(u64, index) * self.piece_length;
+        if (at >= self.total) return 0;
         return @min(self.piece_length, self.total - at);
     }
 

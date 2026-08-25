@@ -93,8 +93,9 @@ jobs:
               -e "s/__SHA256_AARCH64_LINUX__/$(get blizzard-legacy-dl-aarch64-linux-musl)/" \
               -e "s/__SHA256_X86_64_LINUX__/$(get blizzard-legacy-dl-x86_64-linux-musl)/" \
               Formula/blizzard-legacy-dl.rb > dist/blizzard-legacy-dl.rb
-          # a leftover placeholder means the artifact names drifted from the template
+          # a leftover placeholder, or an empty one, means the artifact names drifted
           ! grep -q '__' dist/blizzard-legacy-dl.rb
+          ! grep -qE '(sha256|version) ""' dist/blizzard-legacy-dl.rb
           grep -E 'version|sha256' dist/blizzard-legacy-dl.rb
       - uses: softprops/action-gh-release@v2
         with:

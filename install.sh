@@ -39,15 +39,25 @@ trap 'rm -rf "$tmp"' EXIT
 echo "downloading $asset"
 curl -fsSL "$base/$asset" -o "$tmp/bin"
 
-# The release publishes SHA256SUMS; check against it when we can.
+# Refuse to install something we could not verify, unless told to.
+want=""
 if curl -fsSL "$base/SHA256SUMS" -o "$tmp/sums" 2>/dev/null; then
   want=$(awk -v a="$asset" '$2 == a || $2 == "*"a {print $1}' "$tmp/sums" | head -1)
-  if [ -n "$want" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$tmp/bin" | cut -d' ' -f1)
-    else got=$(shasum -a 256 "$tmp/bin" | cut -d' ' -f1); fi
-    [ "$want" = "$got" ] || { echo "checksum mismatch for $asset" >&2; exit 1; }
-    echo "checksum ok"
+fi
+if [ "${SKIP_CHECKSUM:-}" = 1 ]; then
+  echo "skipping checksum verification (SKIP_CHECKSUM=1)"
+elif [ -n "$want" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$tmp/bin" | cut -d' ' -f1)
+  else got=$(shasum -a 256 "$tmp/bin" | cut -d' ' -f1); fi
+  if [ "$want" != "$got" ]; then
+    echo "checksum mismatch for $asset (expected $want, got $got)" >&2
+    exit 1
   fi
+  echo "checksum ok"
+else
+  echo "could not read SHA256SUMS for $asset; refusing to install unverified." >&2
+  echo "set SKIP_CHECKSUM=1 to override." >&2
+  exit 1
 fi
 
 chmod +x "$tmp/bin"

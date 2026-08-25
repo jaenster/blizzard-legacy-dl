@@ -129,7 +129,7 @@ fn sockaddr(ip: [4]u8, port: u16) [16]u8 {
     return sa;
 }
 
-pub fn run(port: u16) !void {
+pub fn run(bind_addr: [4]u8, port: u16) !void {
     if (is_win) {
         var wsa: [408]u8 = undefined;
         _ = sys.WSAStartup(0x0202, &wsa);
@@ -140,7 +140,7 @@ pub fn run(port: u16) !void {
     var one: c_int = 1;
     _ = sys.setsockopt(srv, if (is_bsd) 0xffff else 1, 0x0004, @ptrCast(&one), 4); // SO_REUSEADDR
 
-    const sa = sockaddr(.{ 0, 0, 0, 0 }, port);
+    const sa = sockaddr(bind_addr, port);
     if (sys.bind(srv, &sa, 16) != 0) {
         std.debug.print("cannot bind :{d} — something else is already on it\n", .{port});
         return error.BindFailed;
@@ -148,14 +148,14 @@ pub fn run(port: u16) !void {
     if (sys.listen(srv, 64) != 0) return error.ListenFailed;
 
     std.debug.print(
-        \\proxy listening on :{d}
+        \\proxy listening on {d}.{d}.{d}.{d}:{d}
         \\
         \\point the downloader's machine at it — Internet Options -> Connections ->
-        \\LAN settings -> proxy <this host>:{d} — then start the downloader. Every
-        \\request it makes is printed here, verbatim, and forwarded on.
+        \\LAN settings -> proxy — then start the downloader. Every request it makes
+        \\is printed here, verbatim, and forwarded on.
         \\
         \\
-    , .{ port, port });
+    , .{ bind_addr[0], bind_addr[1], bind_addr[2], bind_addr[3], port });
 
     while (true) {
         const c = sys.accept(srv, null, null);
