@@ -1,0 +1,78 @@
+//! Shared item-generation model types (clean-room, Zig-native — NOT the 32-bit
+//! Game.exe ABI). These mirror the roles of D2ItemGenContextStrc and the drop
+//! output, but with idiomatic Zig fields.
+
+const std = @import("std");
+
+/// D2 item quality tier (eD2ItemQuality). Values are the engine's — the quality
+/// cascade and switch dispatch depend on these exact numbers.
+pub const Quality = enum(u8) {
+    invalid = 0,
+    low = 1, // "crude/inferior"
+    normal = 2,
+    superior = 3, // "hiquality"
+    magic = 4,
+    set = 5,
+    rare = 6,
+    unique = 7,
+    crafted = 8,
+    tempered = 9,
+    _,
+};
+
+/// What a single TreasureClass roll produced.
+pub const DropKind = enum { none, gold, item, quiver, bodypart };
+
+/// A rolled drop. `item_code` is the base item (weapon/armor/misc `code`) when
+/// kind == .item. prefix/suffix ids are 1-based indices into MagicPrefix.txt /
+/// MagicSuffix.txt (0 = none), faithful to the engine's `affixId+1` return.
+pub const Drop = struct {
+    kind: DropKind = .none,
+    item_code: [4]u8 = .{ 0, 0, 0, 0 },
+    quality: Quality = .invalid,
+    prefix_id: u16 = 0, // magic/first-affix prefix
+    suffix_id: u16 = 0, // magic/first-affix suffix
+    rare_prefix_ids: [3]u16 = .{ 0, 0, 0 },
+    rare_suffix_ids: [3]u16 = .{ 0, 0, 0 },
+    /// 1-based RarePrefix.txt / RareSuffix.txt rows — the item's rolled NAME, independent of the
+    /// affixes above ("Doom Gorget" is a rare name pair, not a prefix/suffix mod).
+    rare_prefix_name: u16 = 0,
+    rare_suffix_name: u16 = 0,
+    /// 1-based UniqueItems.txt / SetItems.txt row of the selected special item (0 = none), the
+    /// unique/set analogue of prefix_id. This is the SELECTION; the per-property values are rolled
+    /// from `item_seed` on demand by properties.rollDropStats, not stored here.
+    unique_id: u16 = 0,
+    set_id: u16 = 0,
+    /// 1-based QualityItems.txt row picked for a SUPERIOR drop (0 = none) — the engine's item
+    /// nFileIndex, chosen by ITEMMOD_GenerateQualityItem 0x5c2970.
+    quality_id: u16 = 0,
+    /// 1-based LowQualityItems.txt row (Crude/Cracked/Damaged/Low Quality) for a LOW drop.
+    low_quality_id: u16 = 0,
+    /// 1-based MagicPrefix.txt row of the item's AUTOMAGIC affix — the base's `auto prefix` group
+    /// rolled at the tail of ITEM_ApplyQualityAndAffixes. Independent of prefix_id.
+    auto_prefix_id: u16 = 0,
+    sockets: u8 = 0,
+    /// ITEMFLAG_ETHEREAL — rolled for every expansion item by ITEM_ApplyEthereal.
+    ethereal: bool = false,
+    quantity: i32 = 0, // gold amount / quiver count
+    item_level: i32 = 0,
+    /// The low word of this drop's per-item MOD seed (high = 666), so its rolled mod values can be
+    /// reproduced later via rng.Seed.fromValue(item_seed) + properties.rollDropStats. Set at generation.
+    item_seed: u32 = 0,
+
+    pub fn code(self: *const Drop) []const u8 {
+        var n: usize = 0;
+        while (n < 4 and self.item_code[n] != 0) : (n += 1) {}
+        return self.item_code[0..n];
+    }
+};
+
+/// Quality-modifier bonuses propagated down the TC recursion (TreasureClassEx
+/// Magic/Rare/Set/Unique columns). These feed GAME_GetItemQuality as additive
+/// bonuses on the corresponding tier chance.
+pub const QualityMods = struct {
+    magic: i32 = 0,
+    rare: i32 = 0,
+    set: i32 = 0,
+    unique: i32 = 0,
+};

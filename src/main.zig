@@ -9,6 +9,7 @@ const legacy = @import("legacy");
 const proxy = @import("proxy.zig");
 const mpq = @import("libd2").formats.mpq;
 const script = @import("libd2").formats.installer;
+const ptc = @import("libd2").formats.ptc;
 
 const usage =
     \\blizzard-legacy-dl — read a Blizzard legacy downloader stub and fetch its payload
@@ -32,6 +33,8 @@ const usage =
     \\  --cookie <v>   override the CDN access token taken from the stub
     \\  --game <dir>   where install puts the game (default: alongside, named "<payload>-game")
     \\  --no-base      install an expansion on its own, without its base game first
+    \\  --version <v>  install an older version, e.g. 1.09b (or give it as the 3rd argument)
+    \\  --patch-source where patch archives come from
     \\  --platform <p> win32 (default) or macos, for install
     \\  --lang <name>  install this language branch (default English)
     \\
@@ -158,9 +161,15 @@ pub fn main(init: std.process.Init) !void {
     var cookie_override: ?[]const u8 = null;
     var game_dir: ?[]const u8 = null;
     var no_base = false;
+    var want_version: ?[]const u8 = null;
+    var patch_source: []const u8 = "https://files.typeguru.nl/diablo/patches/pc";
     var platform: []const u8 = "win32";
     var language: []const u8 = "English";
     var i: usize = 3;
+    if (argv.len > 3 and argv[3].len != 0 and (std.ascii.isDigit(argv[3][0]))) {
+        want_version = argv[3];
+        i = 4;
+    }
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if ((std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--out")) and i + 1 < argv.len) {
@@ -188,6 +197,12 @@ pub fn main(init: std.process.Init) !void {
             jobs = @max(1, try std.fmt.parseInt(usize, argv[i], 10));
         } else if (std.mem.eql(u8, a, "--sequential")) {
             sequential = true;
+        } else if (std.mem.eql(u8, a, "--version") and i + 1 < argv.len) {
+            i += 1;
+            want_version = argv[i];
+        } else if (std.mem.eql(u8, a, "--patch-source") and i + 1 < argv.len) {
+            i += 1;
+            patch_source = argv[i];
         } else if (std.mem.eql(u8, a, "--no-base")) {
             no_base = true;
         } else if (std.mem.eql(u8, a, "--game") and i + 1 < argv.len) {
@@ -440,6 +455,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk code_buf[0..argv[2].len];
     } else argv[2];
     const both = std.mem.eql(u8, verb, "install") and !no_base;
+    const code_last = argv[2];
     const targets: []const []const u8 =
         if (both and std.mem.eql(u8, code, "D2XP")) &.{ "D2DV", "D2XP" } else if (both and std.mem.eql(u8, code, "W3XP")) &.{ "WAR3", "W3XP" } else &.{argv[2]};
 
@@ -580,8 +596,108 @@ pub fn main(init: std.process.Init) !void {
 
         if (failed != 0) return error.Incomplete;
 
-        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language);
+        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language, if (std.mem.eql(u8, target, code_last)) want_version else null, patch_source, &client);
     } // end of the per-product loop
+}
+
+/// Take a game directory back to an older version, the way Blizzard's patch installer does.
+///
+/// The payload carries the original build of each product — 1.00 for the base game, 1.07 for the
+/// expansion — under `PC-100`/`PC-100x`. Patches are cumulative ("upgrades from version 1.00 or
+/// later", as the 1.09 script puts it), so one archive gets from that base to any later version.
+///
+/// Two tables drive it. One maps members to files on disk; the other, `patch.lst`, maps members
+/// into `patch_d2.mpq`, which the script deletes and rebuilds outright rather than adding to.
+fn patchTo(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    client: *std.http.Client,
+    set: *const mpq.Set,
+    game: []const u8,
+    version: []const u8,
+    expansion: bool,
+    source: []const u8,
+) !void {
+    // Version strings are written 1.09b but the archives are named 109b.
+    var tidy: std.ArrayList(u8) = .empty;
+    for (version) |c| if (c != '.') try tidy.append(gpa, c);
+    const url = try std.fmt.allocPrint(gpa, "{s}/{s}Patch_{s}.exe", .{
+        source, if (expansion) "LOD" else "D2", tidy.items,
+    });
+    std.debug.print("\npatching to {s}\n  {s}\n", .{ version, url });
+
+    const exe = fetchUrl(gpa, client, url) catch |e| {
+        std.debug.print("  no patch archive for {s} ({t})\n", .{ version, e });
+        return error.NoSuchVersion;
+    };
+    var patch = try mpq.Archive.open(gpa, exe);
+    defer patch.deinit(gpa);
+
+    // The base to patch, straight out of the payload.
+    const prefix = if (expansion) "PC-100x\\" else "PC-100\\";
+    var base: std.StringHashMapUnmanaged([]const u8) = .empty;
+
+    // The disk map has no fixed name, so it is found by shape: the only member that is text and
+    // pairs members with $(InstallPath) destinations.
+    var disk_map: ?[]const u8 = null;
+    for (0..patch.blocks.len) |i| {
+        const idx: u32 = @intCast(i);
+        const key = patch.recoverKey(gpa, idx) catch null;
+        const data = patch.readBlock(gpa, idx, key) catch continue;
+        if (data.len > 8192 or data.len < 16) continue;
+        if (std.mem.indexOf(u8, data, ";$(InstallPath)") != null) {
+            disk_map = data;
+            break;
+        }
+    }
+
+    var wrote: usize = 0;
+    if (disk_map) |text| {
+        for (try ptc.parseMap(gpa, text)) |m| {
+            const rec_bytes = patch.read(gpa, m.member) catch continue;
+            const rec = ptc.Record.parse(rec_bytes) catch continue;
+            const name = m.basename();
+
+            // The source is the original build for this product, not what is on disk.
+            const src = base.get(name) orelse blk: {
+                const member = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, name });
+                const b = set.read(gpa, member) catch &[_]u8{};
+                try base.put(gpa, name, b);
+                break :blk b;
+            };
+            const out = ptc.apply(gpa, rec, src) catch |e| {
+                std.debug.print("  refused {s}: {t}\n", .{ name, e });
+                continue;
+            };
+            const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, name });
+            try writeWhole(io, full, out);
+            wrote += 1;
+        }
+    }
+
+    // patch_d2.mpq is rebuilt from nothing, exactly as the script asks.
+    var rebuilt: usize = 0;
+    if (patch.read(gpa, "patch.lst")) |lst| {
+        var members: std.ArrayList(mpq.NewFile) = .empty;
+        for (try ptc.parseMap(gpa, lst)) |m| {
+            // Here the pair is the other way round: archive path first, member second.
+            const data = patch.read(gpa, m.destination) catch continue;
+            const rec = ptc.Record.parse(data) catch continue;
+            const body = ptc.apply(gpa, rec, &[_]u8{}) catch continue;
+            try members.append(gpa, .{ .name = m.member, .data = body });
+        }
+        if (members.items.len != 0) {
+            var slots: u32 = 16;
+            while (slots < members.items.len * 2) slots *= 2;
+            const empty = try mpq.empty(gpa, slots);
+            const built = try mpq.append(gpa, empty, members.items);
+            const full = try std.fmt.allocPrint(gpa, "{s}/patch_d2.mpq", .{game});
+            try writeWhole(io, full, built);
+            rebuilt = members.items.len;
+        }
+    } else |_| {}
+
+    std.debug.print("  {d} files patched, patch_d2.mpq rebuilt with {d} members\n", .{ wrote, rebuilt });
 }
 
 /// Build the game directory from a payload that has just been fetched.
@@ -596,6 +712,9 @@ fn install(
     game: []const u8,
     platform: []const u8,
     language: []const u8,
+    version: ?[]const u8,
+    patch_source: []const u8,
+    client: *std.http.Client,
 ) !void {
     // The script names its own archives Tome1..Tome6; a payload has one of them, or a few.
     var set: mpq.Set = .{};
@@ -690,8 +809,10 @@ fn install(
         added += add.items.len;
     }
 
-    std.debug.print("{d} files, {d} members added to installed archives, {d} steps only Windows can do\n" ++
-        "the game is in {s}\n", .{ wrote, added, elsewhere, game });
+    std.debug.print("{d} files, {d} members added to installed archives, {d} steps only Windows can do\n", .{ wrote, added, elsewhere });
+
+    if (version) |v| try patchTo(gpa, io, client, &set, game, v, found > 0 and set.has("PC-100x\\Game.exe"), patch_source);
+    std.debug.print("the game is in {s}\n", .{game});
 }
 
 /// A piece map, the way a torrent client draws one: a grid of cells, each standing for a run of
