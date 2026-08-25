@@ -32,6 +32,53 @@ pub const Error = error{
 /// The exact agent the piece fetcher identifies as. Not the tracker's agent.
 pub const user_agent = "Blizzard Web Client";
 
+/// Find the CDN access token the stub carries, if it still carries one.
+///
+/// This is the whole reason a piece request either works or returns 403. The download host
+/// runs Akamai token authentication: every request must present a signed cookie of the form
+///
+///     <name>=expires=<unix>~access=<path glob>~md5=<32 hex>
+///
+/// and without it every path under the host answers 403, `/` and `/robots.txt` included —
+/// which is exactly what a deny looks like from outside and why it reads as an IP block.
+///
+/// getLegacy mints one per stub, scoped to that product's directory and good for about a week,
+/// and stores it in the stub after the torrent, between two four-byte tags. Nothing in the
+/// executable computes it, so it cannot be re-signed locally — but fetching a stub gets a fresh
+/// one, which is why asking for a product code by name always works.
+///
+/// Anchored on `~md5=` followed by 32 hex characters, then walked back to the start of the
+/// cookie, rather than on the name — the name is Blizzard's choice and may differ per product.
+pub fn findToken(exe: []const u8) ?[]const u8 {
+    const anchor = "~md5=";
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, exe, at, anchor)) |m| : (at = m + 1) {
+        const digest_at = m + anchor.len;
+        if (digest_at + 32 > exe.len) return null;
+        var ok = true;
+        for (exe[digest_at..][0..32]) |c| {
+            if (!std.ascii.isHex(c)) ok = false;
+        }
+        if (!ok) continue;
+
+        // Back up over the token's own characters; the bytes in front of it are the tag and
+        // are not part of any cookie.
+        var start = m;
+        while (start > 0) : (start -= 1) {
+            const c = exe[start - 1];
+            const is_token = std.ascii.isAlphanumeric(c) or
+                std.mem.indexOfScalar(u8, "=~/*._%-", c) != null;
+            if (!is_token) break;
+        }
+        const tok = exe[start .. digest_at + 32];
+        // A real one names a path it grants; anything else is a coincidence in the binary.
+        if (std.mem.indexOf(u8, tok, "expires=") == null) continue;
+        if (std.mem.indexOf(u8, tok, "~access=") == null) continue;
+        return tok;
+    }
+    return null;
+}
+
 // ── bencode ──────────────────────────────────────────────────────────────────────────────────
 
 pub const Value = union(enum) {
@@ -199,6 +246,9 @@ pub const Metainfo = struct {
     files: []File,
     total: u64,
     infohash: [20]u8,
+    /// The CDN access token from the stub, sent as a Cookie on every piece request. Null for a
+    /// bare .torrent, which carries no token — use a stub, or pass one in.
+    token: ?[]const u8 = null,
 
     pub fn pieceCount(self: Metainfo) usize {
         return self.pieces.len / 20;
@@ -366,6 +416,7 @@ pub fn fromStub(gpa: std.mem.Allocator, stub: []const u8) !Metainfo {
             .files = try files.toOwnedSlice(gpa),
             .total = total,
             .infohash = ih,
+            .token = findToken(exe),
         };
     }
     return Error.NoTorrent;

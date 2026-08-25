@@ -126,25 +126,41 @@ Two details cost me an afternoon, so they are worth writing down. Pieces go thro
 and says `Blizzard Downloader 2.2`, while pieces come from
 `InternetOpenA("Blizzard Web Client", ...)`. Copy the wrong one and nothing works.
 
-## The catch
+## The access token
 
-`rogue.blizzard.com.edgesuite.net` returns 403 for every path, `/` and `/robots.txt` included.
-It is not this tool sending the wrong thing, and it is not one blocked network:
+Every piece request has to carry a signed cookie, and this is the single thing that decides
+whether the CDN answers 200 or 403:
 
-- Blizzard's own `Downloader_Diablo2_enUS.exe`, run under wine behind a logging proxy, sends
-  byte for byte what this tool sends — and gets the same 403. That is what `proxy` below is for;
-  the comparison is a two-minute job, not a matter of opinion.
-- Akamai tells the two cases apart. A hostname it has no configuration for answers
-  `400, Reference #9`. This one answers `403, Reference #18`: a live property with a deny rule.
-- It is not the caller's reputation either. `dist.blizzard.com`, `blzddist1-a.akamaihd.net` and
-  the regional CDN names all answer the same machine with an ordinary 404.
-- Denied from Dutch consumer broadband and from a German datacentre, over HTTP and HTTPS, on six
-  edge addresses, and on Akamai's staging network.
+```
+Cookie: bcac=expires=<unix>~access=/applications/Diablo2/1.14B/D2/enUS/*~md5=<32 hex>
+```
 
-All 44 Windows stubs — every product, every locale — point at that one host, so there is no
-second base to fall back to. The piece protocol itself is understood and implemented; what is
-missing is a host willing to serve it. `--base` points `fetch` at any mirror laid out the same
-way, and `verify` checks whatever comes back against Blizzard's own piece hashes.
+That is Akamai token authentication. Without it **every** path under the host returns 403 —
+`/` and `/robots.txt` included — so from outside it is indistinguishable from an IP-level block,
+which is exactly what it looks like and exactly what I assumed for a while. The `Reference #18`
+in Akamai's error page is what a token failure looks like; an unknown hostname gives a different
+code (`400`, `Reference #9`).
+
+Nothing in the downloader computes the token. `getLegacy` mints one per stub download, scopes it
+to that product's directory, gives it about a week, and embeds it in the stub after the bencoded
+torrent between two four-byte tags. The client reads it as `cookieName`/`cookieData` and applies
+it with `InternetSetCookieW`, which is a `Cookie` header on the wire.
+
+So this tool pulls the token out of the stub and sends it, and `info` prints it:
+
+```
+cdn token       : bcac=expires=1788256690~access=/applications/…/enUS/*~md5=70edef94…
+```
+
+Two consequences worth knowing:
+
+- **Ask for a product code and it always works.** `fetch D2DV` downloads a fresh stub, which
+  carries a fresh token. An old stub on disk may have an expired one.
+- **An expired token cannot be re-signed** — the signing key is Blizzard's and is not in the
+  binary. Get a new stub. `--cookie` overrides it if you have one from elsewhere.
+
+A bare `.torrent` carries no token, so it will 403 against Blizzard's host. Use a stub, pass
+`--cookie`, or point `--base` somewhere that does not check.
 
 ## Watching the real downloader
 

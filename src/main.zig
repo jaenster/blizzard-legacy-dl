@@ -25,6 +25,7 @@ const usage =
     \\  --retries <n>  per-piece retries before giving up (default 3)
     \\  --base <url> fetch pieces from a mirror instead of the (dead) Blizzard host
     \\  --sequential   fetch pieces in order; the client shuffles them, and so do we
+    \\  --cookie <v>   override the CDN access token taken from the stub
     \\
     \\run options (run does everything fetch does, in the client's order):
     \\  --ini <path>          a BlizzardDownloader.ini to read config from
@@ -140,6 +141,7 @@ pub fn main(init: std.process.Init) !void {
     var server_config: ?[]const u8 = null;
     var no_tracker = false;
     var sequential = false;
+    var cookie_override: ?[]const u8 = null;
     var i: usize = 3;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -165,6 +167,9 @@ pub fn main(init: std.process.Init) !void {
             no_tracker = true;
         } else if (std.mem.eql(u8, a, "--sequential")) {
             sequential = true;
+        } else if (std.mem.eql(u8, a, "--cookie") and i + 1 < argv.len) {
+            i += 1;
+            cookie_override = argv[i];
         } else if (std.mem.eql(u8, a, "--base") and i + 1 < argv.len) {
             i += 1;
             base = argv[i];
@@ -333,6 +338,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("7  pieces\n", .{});
     }
 
+    // Without this every piece request comes back 403. The client sends it via
+    // InternetSetCookieW; a Cookie header is the same thing on the wire.
+    if (meta.token) |t| cookie = t;
+    if (cookie_override) |c| cookie = c;
+
     var b1: [32]u8 = undefined;
     if (std.mem.eql(u8, verb, "info")) {
         std.debug.print(
@@ -343,6 +353,7 @@ pub fn main(init: std.process.Init) !void {
             \\announce        : {s}   (dead since ~2016)
             \\direct download : {s}
             \\servers         : {d}
+            \\cdn token       : {s}
             \\piece length    : {d}
             \\pieces          : {d}
             \\files           : {d}
@@ -351,6 +362,7 @@ pub fn main(init: std.process.Init) !void {
         , .{
             meta.name,       meta.locale, meta.launch_target, meta.infohash,
             meta.announce,   meta.direct_download, meta.servers.len,
+            meta.token orelse "none — the CDN will answer 403 without one",
             meta.piece_length, meta.pieceCount(), meta.files.len,
             meta.total,      human(meta.total, &b1),
         });

@@ -46,6 +46,8 @@ const sys = if (is_win) struct {
     pub extern "ws2_32" fn shutdown(s: Sock, how: c_int) callconv(.winapi) c_int;
     pub extern "ws2_32" fn closesocket(s: Sock) callconv(.winapi) c_int;
     pub extern "ws2_32" fn setsockopt(s: Sock, lvl: c_int, n: c_int, v: *const anyopaque, l: c_int) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn ioctlsocket(s: Sock, cmd: c_long, arg: *c_ulong) callconv(.winapi) c_int;
+    pub extern "ws2_32" fn select(n: c_int, r: ?*anyopaque, w: ?*[128]u8, e: ?*anyopaque, t: *const [16]u8) callconv(.winapi) c_int;
     pub extern "ws2_32" fn getaddrinfo(n: [*:0]const u8, s: ?[*:0]const u8, h: *const AddrInfo, r: *?*AddrInfo) callconv(.winapi) c_int;
     pub extern "ws2_32" fn freeaddrinfo(r: *AddrInfo) callconv(.winapi) void;
 } else struct {
@@ -59,6 +61,8 @@ const sys = if (is_win) struct {
     pub extern "c" fn shutdown(s: c_int, how: c_int) c_int;
     pub extern "c" fn close(s: c_int) c_int;
     pub extern "c" fn setsockopt(s: c_int, lvl: c_int, n: c_int, v: *const anyopaque, l: u32) c_int;
+    pub extern "c" fn fcntl(s: c_int, cmd: c_int, arg: c_int) c_int;
+    pub extern "c" fn select(n: c_int, r: ?*anyopaque, w: ?*[128]u8, e: ?*anyopaque, t: *const [16]u8) c_int;
     pub extern "c" fn getaddrinfo(n: [*:0]const u8, s: ?[*:0]const u8, h: *const AddrInfo, r: *?*AddrInfo) c_int;
     pub extern "c" fn freeaddrinfo(r: *AddrInfo) void;
 };
@@ -276,10 +280,59 @@ fn dial(host: []const u8, port: u16) !Sock {
         const sa = sockaddr(addr[4..8].*, port);
         const s = sys.socket(2, 1, 0);
         if (s == invalid) continue;
-        if (sys.connect(s, &sa, 16) == 0) return s;
+        if (connectTimeout(s, &sa, connect_seconds)) return s;
         closeSock(s);
     }
     return error.ConnectionRefused;
+}
+
+/// How long to wait for an upstream to answer before giving up on it.
+///
+/// The default OS connect timeout is over a minute, and the downloader asks a hardcoded address
+/// that has been dead for years before it transfers anything. Inheriting that stall would make
+/// the proxy look hung when it is simply being patient on the program's behalf — so it is not
+/// patient. Failing fast lets the client get its error and move on, which is the whole point of
+/// watching it.
+const connect_seconds: i64 = 8;
+
+/// Connect with a deadline: go non-blocking, start the connect, wait for writability, restore.
+fn connectTimeout(s: Sock, sa: *const [16]u8, seconds: i64) bool {
+    setNonBlocking(s, true);
+    defer setNonBlocking(s, false);
+
+    if (sys.connect(s, sa, 16) == 0) return true;
+
+    // An fd_set is a bitmap of descriptors; on Windows it is a count followed by handles. Both
+    // fit in this buffer for the single descriptor being waited on.
+    var set = std.mem.zeroes([128]u8);
+    if (is_win) {
+        std.mem.writeInt(u32, set[0..4], 1, .little);
+        std.mem.writeInt(u64, set[8..16], @intCast(s), .little);
+    } else {
+        const fd: usize = @intCast(s);
+        if (fd >= 1024) return false;
+        set[fd / 8] |= @as(u8, 1) << @intCast(fd % 8);
+    }
+
+    var tv = std.mem.zeroes([16]u8);
+    std.mem.writeInt(i64, tv[0..8], seconds, .little);
+    const n: c_int = if (is_win) 0 else @as(c_int, @intCast(s)) + 1;
+    if (sys.select(n, null, &set, null, &tv) <= 0) return false;
+
+    // Writable can also mean "refused"; a zero-length send settles which.
+    return sendAll(s, "");
+}
+
+fn setNonBlocking(s: Sock, on: bool) void {
+    if (is_win) {
+        var v: c_ulong = if (on) 1 else 0;
+        _ = sys.ioctlsocket(s, @bitCast(@as(u32, 0x8004667E)), &v); // FIONBIO
+    } else {
+        const flags = sys.fcntl(s, 3, 0); // F_GETFL
+        if (flags < 0) return;
+        const nonblock: c_int = 0x0004; // O_NONBLOCK, same on macOS and Linux
+        _ = sys.fcntl(s, 4, if (on) flags | nonblock else flags & ~nonblock); // F_SETFL
+    }
 }
 
 fn splitHostPort(s: []const u8, default: u16) struct { []const u8, u16 } {
