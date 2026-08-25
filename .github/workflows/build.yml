@@ -28,11 +28,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - run: zig build test
+      - run: zig build test --summary all
       - run: zig build
-      # Fetch, verify and assembly, end to end, against a payload built on the spot. Blizzard's
-      # host is gone, so this is the only way any of it stays covered.
-      - run: python3 scripts/roundtrip.py
 
   image:
     needs: test

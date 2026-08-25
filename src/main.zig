@@ -56,14 +56,12 @@ const locales = [_][]const u8{
     "ja-JP", "ko-KR", "pl-PL", "pt-BR", "ru-RU", "zh-CN", "zh-TW",
 };
 
-// Files go through `std.Io`, which is the only file layer that exists on every target this
-// ships for — the POSIX calls this used before have no counterpart on Windows, and the payload
-// being a Windows installer makes that the one platform it would be silly not to run on.
+// Files go through `std.Io`: the POSIX calls this used before have no Windows counterpart,
+// and the payload being a Windows installer makes that the one platform to support.
 const File = std.Io.File;
 const Dir = std.Io.Dir;
 
-/// Paths reach here both relative (`-o ./out`) and absolute, and `Dir` splits those into
-/// different calls.
+// Paths arrive both relative and absolute, and `Dir` splits those into different calls.
 fn openFile(io: std.Io, path: []const u8, mode: Dir.OpenFileOptions.Mode) !File {
     return if (std.fs.path.isAbsolute(path))
         Dir.openFileAbsolute(io, path, .{ .mode = mode })
@@ -338,8 +336,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("7  pieces\n", .{});
     }
 
-    // Without this every piece request comes back 403. The client sends it via
-    // InternetSetCookieW; a Cookie header is the same thing on the wire.
+    // Without this every piece request comes back 403.
     if (meta.token) |t| cookie = t;
     if (cookie_override) |c| cookie = c;
 
@@ -429,13 +426,8 @@ pub fn main(init: std.process.Init) !void {
     var done: usize = 0;
     var failed: usize = 0;
 
-    // The client does not walk the pieces in order. It builds a vector of candidates, runs
-    // std::random_shuffle over it, then sorts by peer availability with a NON-stable sort, so
-    // the shuffle survives as the tie-break among equal scores. Every Blizzard stub sets
-    // "disable p2p", so there are no peers, every score is equal, and what is left is a fresh
-    // random permutation on each run — which is why the real progress bar fills in scattered
-    // blocks. Matching it matters: a straight 0,1,2,... scan is a visibly different access
-    // pattern to whatever is serving the pieces.
+    // Pieces are fetched in a random order rather than 0,1,2,... — that is what the CDN
+    // expects to see, and it spreads a resumed download instead of replaying one region.
     const order = try gpa.alloc(usize, last - from + 1);
     for (order, 0..) |*o, k| o.* = from + k;
     if (!sequential) {
@@ -550,9 +542,7 @@ fn resolveStub(
 /// The status of the last failed fetch, so a piece failure can say 403 rather than "HttpStatus".
 var last_status: u16 = 0;
 
-/// Set from the cookieName/cookieData config pair. The client hands these to
-/// InternetSetCookieW rather than writing a header itself, which comes to the same thing on the
-/// wire. Both must be present or neither is sent, exactly as HttpDirect_RequestPiece checks.
+// The CDN access token, sent as a Cookie on every piece request.
 var cookie: ?[]const u8 = null;
 
 fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]u8 {

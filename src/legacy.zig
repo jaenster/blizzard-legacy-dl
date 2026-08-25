@@ -1,23 +1,14 @@
-//! Reading Blizzard's legacy downloader, and fetching what it points at.
+//! Reading Blizzard's legacy downloader stub, and fetching what it points at.
 //!
 //! `https://www.battle.net/download/getLegacy?product=D2DV&locale=en-US&os=WIN` hands back a
-//! ~2.7 MB stub. The stub is a BitTorrent client, and the torrent is bencoded inside the
-//! executable itself. Its tracker (`*.tracker.worldofwarcraft.com:3724`) stopped answering years
-//! ago, so every real download now runs over the `direct download` HTTP source instead.
+//! ~2.7 MB stub: a BitTorrent client with the torrent bencoded inside the executable. The
+//! trackers stopped answering years ago, so downloads run over the `direct download` HTTP
+//! source instead.
 //!
-//! The thing worth knowing, and the reason a plain `curl` of the base URL gets you nowhere: the
-//! HTTP source does not serve the payload as files, and not as one ranged stream. It serves
-//! **one numbered file per BitTorrent piece** — `<base>/0`, `<base>/1`, ... `<base>/<n-1>` — and
-//! the client plugs those into the same piece machinery it uses for peers. So pieces arrive in
-//! whatever order the picker asks for, each one is independently verifiable against the SHA-1 in
-//! the metainfo, and fetching them in parallel is free.
-//!
-//! Established by reverse engineering `Blizzard Downloader 2.2.0.1285`:
-//! `HttpDirect_RequestPiece` -> `HttpWinInet_SendRequest`, which goes through WinInet, not the
-//! `Http-get.cpp` socket path. That matters because the two send different agents — the socket
-//! path is the tracker's and says `Blizzard Downloader 2.2`; the piece path comes from
-//! `InternetOpenA("Blizzard Web Client", ...)`.
-
+//! That source does not serve the payload as files, and not as one ranged stream. It serves one
+//! numbered file per piece — `<base>/0`, `<base>/1`, … — so pieces can be fetched in any order
+//! and in parallel, and each is independently checkable against its SHA-1 in the metainfo.
+//! Requests must carry the stub's access token as a cookie or the CDN answers 403.
 const std = @import("std");
 
 pub const Error = error{
@@ -71,7 +62,7 @@ pub fn findToken(exe: []const u8) ?[]const u8 {
             if (!is_token) break;
         }
         const tok = exe[start .. digest_at + 32];
-        // A real one names a path it grants; anything else is a coincidence in the binary.
+        // A real one names the path it grants; anything else is a chance match.
         if (std.mem.indexOf(u8, tok, "expires=") == null) continue;
         if (std.mem.indexOf(u8, tok, "~access=") == null) continue;
         return tok;
@@ -151,11 +142,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, at: usize) Error!struct
 
 pub const File = struct { length: u64, path: []const u8 };
 
-/// One HTTP piece source, and the pieces it is allowed to serve.
-///
-/// The downloader keeps a vector of these and picks the first whose range covers the piece it
-/// wants, sticking with a server while its throughput holds up. A plain `direct download` URL
-/// covers everything; a `server list` entry covers only `begin..end`.
+/// One HTTP piece source and the pieces it may serve. `direct download` covers everything; a
+/// `server list` entry covers only `begin..end`.
 pub const Server = struct {
     url: []const u8,
     first: u64 = 0,
@@ -166,23 +154,14 @@ pub const Server = struct {
     }
 };
 
-/// Expand one `direct download` string into every server URL it names.
+/// Expand a `direct download` string into the servers it names.
 ///
-/// Faithful to DirectDownload_ExpandServerUrls in the downloader, whose delimiters were read
-/// off the `MOV DL,imm` at each split call site:
+/// Splits on `|`. A URL with a `[...]` group before the path expands: the body splits on `,`,
+/// each item on `-` for an inclusive range, and every integer N yields `prefix ++ N ++ path`.
+/// `path` starts at the first `/`, so host text after `]` is dropped — the bracket is meant to
+/// end the hostname. Anything else passes through verbatim.
 ///
-///   * the string splits on `|`, so one entry may name several URLs;
-///   * a URL not starting with `http://`, or with no `[...]` group before the first `/` after
-///     the host, is taken verbatim;
-///   * otherwise the bracket body splits on `,`, each item splits on `-`, and a two-part item
-///     is the inclusive integer range `a..b`;
-///   * each integer N yields `prefix ++ N ++ path`, where `path` starts at the first `/` after
-///     the host — so any host text between `]` and the path is dropped, which means the bracket
-///     is meant to end the hostname.
-///
-/// So `http://dl[1-3,7].example/x` is four servers. None of Blizzard's own stubs use any of
-/// this — every one carries a single bracket-free URL — but the client accepts it, so a mirror
-/// can hand out a whole fleet in one string.
+/// `http://dl[1-3,7]/x` is four servers.
 pub fn expandServerUrls(gpa: std.mem.Allocator, spec: []const u8, out: *std.ArrayList(Server)) !void {
     var urls = std.mem.splitScalar(u8, spec, '|');
     while (urls.next()) |url| {
@@ -234,8 +213,7 @@ pub const Metainfo = struct {
     announce: []const u8,
     /// The `direct download` value exactly as the torrent carries it, before expansion.
     direct_download: []const u8,
-    /// Every HTTP piece source, in the order the client would consider them: the expansion of
-    /// `direct download` first, then each `server list` entry with its piece range.
+    /// Every piece source: the expansion of `direct download`, then each `server list` entry.
     servers: []Server,
     locale: []const u8,
     launch_target: []const u8,
@@ -246,8 +224,8 @@ pub const Metainfo = struct {
     files: []File,
     total: u64,
     infohash: [20]u8,
-    /// The CDN access token from the stub, sent as a Cookie on every piece request. Null for a
-    /// bare .torrent, which carries no token — use a stub, or pass one in.
+    /// The CDN access token from the stub, sent as a Cookie on every piece request. A bare
+    /// .torrent carries none.
     token: ?[]const u8 = null,
 
     pub fn pieceCount(self: Metainfo) usize {
@@ -262,9 +240,8 @@ pub const Metainfo = struct {
         return @min(self.piece_length, self.total - at);
     }
 
-    /// The base to use for `index`: the first server whose range covers it, which is how the
-    /// client chooses. `attempt` walks past servers already tried, so a piece that fails on one
-    /// mirror is retried on the next rather than hammering the same host.
+    /// The first server whose range covers `index`. `attempt` walks past ones already tried, so a
+    /// retry lands on the next mirror rather than the same host.
     pub fn serverFor(self: Metainfo, index: usize, attempt: usize) ?Server {
         var seen: usize = 0;
         for (self.servers) |s| {
@@ -583,8 +560,7 @@ test "a server only serves the pieces its range covers" {
 
 // ── tracker ──────────────────────────────────────────────────────────────────────────────────
 
-/// Percent-escape a value for the announce query, escaping everything that is not unreserved.
-/// The info hash and peer id are raw bytes, not text, so this has to be byte-wise.
+/// Percent-escape for the announce query. Byte-wise: the info hash and peer id are raw bytes.
 pub fn urlEscape(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     for (raw) |c| switch (c) {
@@ -596,12 +572,9 @@ pub fn urlEscape(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 pub const Event = enum { started, stopped };
 
-/// The announce URL, built the way Tracker_BuildAnnounceUrl builds it.
-///
-/// Faithful down to the odd parts: the port is the literal "3724" rather than any port this
-/// program listens on, and the progress figures are fixed rather than measured — `started`
-/// always claims nothing done, `stopped` always claims everything done. The client never sends
-/// `event=completed` or `compact=1`; both strings are in the binary with no reference to them.
+/// The announce URL. The port is always "3724" and the progress figures are fixed rather than
+/// measured, which is what the tracker expects from this client. Only `started` and `stopped`
+/// are ever sent.
 pub fn announceUrl(
     gpa: std.mem.Allocator,
     announce: []const u8,
@@ -628,10 +601,7 @@ pub fn announceUrl(
     });
 }
 
-/// A 20-byte peer id. The client derives one from a machine identifier and hex-encodes ten
-/// bytes of it, falling back to twenty random bytes in [0x21,0xff] when that lookup fails.
-/// Taking the fallback shape on purpose: it is a real path in the client and it does not put a
-/// machine identifier on the wire.
+/// A 20-byte peer id: twenty random bytes in [0x21,0xff]. No machine identifier on the wire.
 pub fn peerId(seed: u64) [20]u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     var id: [20]u8 = undefined;
@@ -651,7 +621,7 @@ pub const Announce = struct {
     threshold: ?i64 = null,
 };
 
-/// Parse an announce reply the way Tracker_ParseAnnounceResponse parses it.
+/// Parse an announce reply.
 pub fn parseAnnounce(gpa: std.mem.Allocator, body: []const u8) !Announce {
     if (body.len == 0 or body[0] != 'd') return Error.NoTorrent;
     const root, _ = try decode(gpa, body, 0);

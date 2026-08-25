@@ -30,6 +30,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the CLI: zig build run -- info <downloader.exe>").dependOn(&run.step);
 
+    const test_step = b.step("test", "Run the tests");
+
     const tests = b.addTest(.{ .root_module = legacy });
-    b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // fetch, verify and reassembly against a payload built and served on the spot
+    const e2e = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "legacy", .module = legacy }},
+        .link_libc = true,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(e2e).step);
 }

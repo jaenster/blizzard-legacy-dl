@@ -257,10 +257,8 @@ fn pump(client: Sock, up: Sock) void {
     _ = sys.shutdown(up, if (is_win) 1 else 1); // SHUT_WR
 }
 
-/// Resolve through the platform's own resolver rather than Zig's, which reads
-/// `/etc/resolv.conf` directly. On macOS that file is a placeholder — the real nameservers are
-/// only visible through `scutil` — so a machine whose resolv.conf points somewhere narrow, as a
-/// VPN's split-horizon resolver does, resolves some names and hangs on the rest.
+// Resolve through the platform resolver, not Zig's — that one reads /etc/resolv.conf,
+// which on macOS is a placeholder, so a VPN resolver there breaks some lookups.
 fn dial(host: []const u8, port: u16) !Sock {
     var name: [256]u8 = undefined;
     if (host.len >= name.len) return error.NameTooLong;
@@ -286,16 +284,11 @@ fn dial(host: []const u8, port: u16) !Sock {
     return error.ConnectionRefused;
 }
 
-/// How long to wait for an upstream to answer before giving up on it.
-///
-/// The default OS connect timeout is over a minute, and the downloader asks a hardcoded address
-/// that has been dead for years before it transfers anything. Inheriting that stall would make
-/// the proxy look hung when it is simply being patient on the program's behalf — so it is not
-/// patient. Failing fast lets the client get its error and move on, which is the whole point of
-/// watching it.
+// How long to wait for an upstream before giving up. The OS default is over a minute,
+// and the client asks a long-dead address before it transfers anything.
 const connect_seconds: i64 = 8;
 
-/// Connect with a deadline: go non-blocking, start the connect, wait for writability, restore.
+// Connect with a deadline: go non-blocking, connect, wait for writability, restore.
 fn connectTimeout(s: Sock, sa: *const [16]u8, seconds: i64) bool {
     setNonBlocking(s, true);
     defer setNonBlocking(s, false);
