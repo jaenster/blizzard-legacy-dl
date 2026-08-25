@@ -1,0 +1,25 @@
+.{
+    .name = .d2_game,
+    .version = "0.6.5",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x130ba7a43418f48b,
+
+    // The shared Stat/Item model foundation (seed-RNG, Stat/StatList, ...) lives
+    // in d2-core; sim re-exports those types so its public API is unchanged.
+    .dependencies = .{
+        .d2_core = .{ .path = "../core" },
+        .d2_data = .{ .path = "../data" },
+        .d2_net = .{ .path = "../net" },
+        .d2_drlg = .{ .path = "../drlg" },
+        .d2_item = .{ .path = "../item" },
+        .d2_world = .{ .path = "../world" },
+        .d2_pathfinding = .{ .path = "../pathfinding" },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

@@ -1,0 +1,40 @@
+.{
+    .name = .libd2,
+    .version = "0.6.5",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x5edb35b5ed14bac1,
+
+    // The root package re-exports each sub-package's public module so an EXTERNAL
+    // project can depend on libd2 once (`.libd2 = .{ .path = "…/libd2" }`) and
+    // `@import` any of them via `dep.module("d2-…")`. See docs/consuming-libd2.md.
+    .dependencies = .{
+        .d2_core = .{ .path = "packages/core" },
+        .d2_data = .{ .path = "packages/data" },
+        .d2_game = .{ .path = "packages/game" },
+        .d2_item = .{ .path = "packages/item" },
+        .d2_drlg = .{ .path = "packages/drlg" },
+        .d2_formats = .{ .path = "packages/formats" },
+        .d2_save = .{ .path = "packages/save" },
+        .d2_util = .{ .path = "packages/util" },
+        .d2_world = .{ .path = "packages/world" },
+        .d2_pathfinding = .{ .path = "packages/pathfinding" },
+        .d2_net = .{ .path = "packages/net" },
+        .d2_bnet = .{ .path = "packages/bnet" },
+        .d2_client = .{ .path = "packages/client" },
+        .d2_render = .{ .path = "packages/render" },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        // The umbrella module's source. Without it a fetched libd2 has a `libd2` module whose
+        // root file is not in the package, so every consumer fails with file_hash FileNotFound —
+        // and nothing in this repo notices, because building from a checkout finds src/ anyway.
+        "src",
+        "packages",
+        "README.md",
+        "LICENSE",
+        "docs",
+        "scripts",
+    },
+}

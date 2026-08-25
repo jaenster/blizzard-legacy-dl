@@ -1,6 +1,12 @@
 .{
     .name = .blizzard_legacy_dl,
     .version = "0.1.0",
+    .dependencies = .{
+        .libd2 = .{
+            .url = "git+https://github.com/jaenster/libd2#352feac13a9b94dcfe774453c048b886ffa929ec",
+            .hash = "libd2-0.6.5-wboU7QdLqgFZ7ED1tFS_7aCz2_4BTdi3YP7pXIHT7Pqb",
+        },
+    },
     .fingerprint = 0x28fb401ea38e62d5,
     .minimum_zig_version = "0.16.0",
     .paths = .{

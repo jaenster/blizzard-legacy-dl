@@ -12,13 +12,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The installer half needs the MPQ reader and the install-script reader, both of which
+    // live in libd2 rather than being carried a second time here.
+    const libd2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
+
     const cli = b.addExecutable(.{
         .name = "blizzard-legacy-dl",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "legacy", .module = legacy }},
+            .imports = &.{
+                .{ .name = "legacy", .module = legacy },
+                .{ .name = "libd2", .module = libd2.module("libd2") },
+            },
             // the file IO goes through libc: std.fs is reworked under 0.16's Io interface
             .link_libc = true,
         }),

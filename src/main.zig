@@ -7,6 +7,8 @@
 const std = @import("std");
 const legacy = @import("legacy");
 const proxy = @import("proxy.zig");
+const mpq = @import("libd2").formats.mpq;
+const script = @import("libd2").formats.installer;
 
 const usage =
     \\blizzard-legacy-dl — read a Blizzard legacy downloader stub and fetch its payload
@@ -16,6 +18,7 @@ const usage =
     \\  plan    <stub.exe> [n]             piece count, and the URL for piece n
     \\  fetch   <stub> [-o dir] [opts]     fetch, verify and assemble the payload
     \\  verify  <stub> [-o dir]            re-verify an assembled payload
+    \\  install <stub> [-o dir] [opts]     fetch, then build the game directory from it
     \\  run     <stub> [-o dir] [opts]     the whole downloader sequence, headless
     \\  proxy   [--port n] [--bind ip]     watch what the real downloader sends, verbatim
     \\
@@ -27,6 +30,10 @@ const usage =
     \\  --jobs <n>     pieces to fetch at once (default 4)
     \\  --sequential   fetch pieces in order; the client shuffles them, and so do we
     \\  --cookie <v>   override the CDN access token taken from the stub
+    \\  --game <dir>   where install puts the game (default: alongside, named "<payload>-game")
+    \\  --no-base      install an expansion on its own, without its base game first
+    \\  --platform <p> win32 (default) or macos, for install
+    \\  --lang <name>  install this language branch (default English)
     \\
     \\run options (run does everything fetch does, in the client's order):
     \\  --ini <path>          a BlizzardDownloader.ini to read config from
@@ -108,6 +115,13 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return buf;
 }
 
+fn writeWhole(io: std.Io, path: []const u8, data: []const u8) !void {
+    const f = try createFile(io, path);
+    defer f.close(io);
+    try f.writePositionalAll(io, data, 0);
+    try f.setLength(io, data.len);
+}
+
 fn human(n: u64, buf: []u8) []const u8 {
     const units = [_][]const u8{ "B", "KB", "MB", "GB" };
     var v: f64 = @floatFromInt(n);
@@ -142,6 +156,10 @@ pub fn main(init: std.process.Init) !void {
     var sequential = false;
     var jobs: usize = 4;
     var cookie_override: ?[]const u8 = null;
+    var game_dir: ?[]const u8 = null;
+    var no_base = false;
+    var platform: []const u8 = "win32";
+    var language: []const u8 = "English";
     var i: usize = 3;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -170,6 +188,17 @@ pub fn main(init: std.process.Init) !void {
             jobs = @max(1, try std.fmt.parseInt(usize, argv[i], 10));
         } else if (std.mem.eql(u8, a, "--sequential")) {
             sequential = true;
+        } else if (std.mem.eql(u8, a, "--no-base")) {
+            no_base = true;
+        } else if (std.mem.eql(u8, a, "--game") and i + 1 < argv.len) {
+            i += 1;
+            game_dir = argv[i];
+        } else if (std.mem.eql(u8, a, "--platform") and i + 1 < argv.len) {
+            i += 1;
+            platform = argv[i];
+        } else if (std.mem.eql(u8, a, "--lang") and i + 1 < argv.len) {
+            i += 1;
+            language = argv[i];
         } else if (std.mem.eql(u8, a, "--cookie") and i + 1 < argv.len) {
             i += 1;
             cookie_override = argv[i];
@@ -373,11 +402,11 @@ pub fn main(init: std.process.Init) !void {
             \\total           : {d} bytes ({s})
             \\
         , .{
-            meta.name,       meta.locale, meta.launch_target, meta.infohash,
-            meta.announce,   meta.direct_download, meta.servers.len,
+            meta.name,              meta.locale,          meta.launch_target, meta.infohash,
+            meta.announce,          meta.direct_download, meta.servers.len,
             meta.token orelse "none — the CDN will answer 403 without one",
-            meta.piece_length, meta.pieceCount(), meta.files.len,
-            meta.total,      human(meta.total, &b1),
+            meta.piece_length,      meta.pieceCount(),    meta.files.len,     meta.total,
+            human(meta.total, &b1),
         });
         return;
     }
@@ -401,129 +430,269 @@ pub fn main(init: std.process.Init) !void {
     // The payload gets its own directory named after the torrent, so the cwd is a fine default
     // and saves typing -o . every time.
     const dir_path = out_dir orelse ".";
-    const last = to orelse meta.pieceCount() - 1;
 
-    // The payload's own top-level directory, so an assembled tree matches what the stub expects
-    // to launch.
-    const dest = try zpath(gpa, &.{ dir_path, meta.name });
-    try mkdirs(init.io, dest);
+    // An expansion installs over its base game, so asking to install one means installing both,
+    // base first. Only `install` does this: fetching an expansion on its own is a fine thing to
+    // want, and `run` walks one payload by definition.
+    var code_buf: [8]u8 = undefined;
+    const code = if (argv[2].len <= code_buf.len) blk: {
+        for (argv[2], 0..) |c, k| code_buf[k] = std.ascii.toUpper(c);
+        break :blk code_buf[0..argv[2].len];
+    } else argv[2];
+    const both = std.mem.eql(u8, verb, "install") and !no_base;
+    const targets: []const []const u8 =
+        if (both and std.mem.eql(u8, code, "D2XP")) &.{ "D2DV", "D2XP" } else if (both and std.mem.eql(u8, code, "W3XP")) &.{ "WAR3", "W3XP" } else &.{argv[2]};
 
-    // Preallocate every file at full length once, so a piece can be written wherever it lands
-    // without caring whether the bytes around it have arrived yet.
-    for (meta.files) |f| {
-        const full = try zpath(gpa, &.{ dest, f.path });
-        if (std.mem.lastIndexOfScalar(u8, full, '/')) |at| try mkdirs(init.io, full[0..at]);
-        const fh = try createFile(init.io, full);
-        defer fh.close(init.io);
-        try fh.setLength(init.io, f.length);
-    }
+    // Both halves land in one game directory, named for what was actually asked for.
+    const game_root = game_dir orelse try std.fmt.allocPrint(gpa, "{s}/{s}-game", .{ dir_path, meta.name });
 
-    if (std.mem.eql(u8, verb, "verify")) {
-        var bad: usize = 0;
-        var buf = try gpa.alloc(u8, meta.piece_length);
-        var p = from;
-        while (p <= last) : (p += 1) {
-            const want = meta.pieceSize(p);
-            const got = readPiece(meta, gpa, init.io, dest, p, buf[0..want]) catch "";
-            meta.verify(p, got) catch {
-                bad += 1;
-                std.debug.print("  piece {d}: BAD\n", .{p});
-            };
+    for (targets) |target| {
+        // Resolve every target, not just the ones that differ by name: the base pass overwrites
+        // `meta`, so the expansion pass cannot reuse what was resolved before the loop.
+        if (targets.len > 1) {
+            std.debug.print("\n=== {s} ===\n", .{target});
+            const base_stub = try resolveStub(gpa, init.io, &client, target, locale, os_);
+            meta = try legacy.fromStub(gpa, base_stub);
+            if (meta.token) |t| cookie = t;
+            if (cookie_override) |c| cookie = c;
         }
-        std.debug.print("{d} pieces checked, {d} bad\n", .{ last - from + 1, bad });
-        return if (bad == 0) {} else error.Corrupt;
-    }
+        const last = to orelse meta.pieceCount() - 1;
 
-    if (!std.mem.eql(u8, verb, "fetch") and !std.mem.eql(u8, verb, "run")) {
-        std.debug.print("{s}", .{usage});
-        return error.Usage;
-    }
+        // The payload's own top-level directory, so an assembled tree matches what the stub expects
+        // to launch.
+        const dest = try zpath(gpa, &.{ dir_path, meta.name });
+        try mkdirs(init.io, dest);
 
-    var done: usize = 0;
-    var failed: usize = 0;
-    var resumed: usize = 0;
-
-    // Pieces are fetched in a random order rather than 0,1,2,... — that is what the CDN
-    // expects to see, and it spreads a resumed download instead of replaying one region.
-    const order = try gpa.alloc(usize, last - from + 1);
-    for (order, 0..) |*o, k| o.* = from + k;
-    if (!sequential) {
-        // Seeded from the clock, the same way the client seeds the rand() behind its shuffle,
-        // so consecutive runs do not repeat an order.
-        const now = std.Io.Timestamp.now(init.io, .real);
-        var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(now.nanoseconds))));
-        prng.random().shuffle(usize, order);
-    }
-
-    // Each piece allocates a body, a URL and a span list. Without a reset they accumulate to
-    // the size of the payload, which for these is well over a gigabyte.
-    var scratch_state = std.heap.ArenaAllocator.init(gpa);
-    defer scratch_state.deinit();
-
-    // The map only makes sense on a terminal; piped or in CI it would be a wall of escapes.
-    const tty = (std.Io.File.stderr().isTty(init.io) catch false);
-    var grid: ?Grid = if (tty) try Grid.init(gpa, init.io, last - from + 1) else null;
-
-    // Several pieces at once. The real client does the same, governed by its maxpending and
-    // maxsimultaneous settings; neither it nor this caps the download rate itself.
-    var shared: Fetch = .{
-        .meta = meta,
-        .order = order,
-        .from = from,
-        .last = last,
-        .dest = dest,
-        .retries = retries,
-        .grid = if (grid) |*g| g else null,
-    };
-
-    {
-        const workers = try gpa.alloc(std.Thread, jobs);
-        defer gpa.free(workers);
-        var spawned: usize = 0;
-        for (workers) |*t| {
-            t.* = std.Thread.spawn(.{}, Fetch.work, .{&shared}) catch break;
-            spawned += 1;
+        // Preallocate every file at full length once, so a piece can be written wherever it lands
+        // without caring whether the bytes around it have arrived yet.
+        for (meta.files) |f| {
+            const full = try zpath(gpa, &.{ dest, f.path });
+            if (std.mem.lastIndexOfScalar(u8, full, '/')) |at| try mkdirs(init.io, full[0..at]);
+            const fh = try createFile(init.io, full);
+            defer fh.close(init.io);
+            try fh.setLength(init.io, f.length);
         }
-        // If no thread could start, do the work here rather than silently finishing early.
-        if (spawned == 0) Fetch.work(&shared) else for (workers[0..spawned]) |t| t.join();
-    }
 
-    done = shared.done;
-    failed = shared.failed;
-    resumed = shared.resumed;
-    if (shared.gave_up) {
+        if (std.mem.eql(u8, verb, "verify")) {
+            var bad: usize = 0;
+            var buf = try gpa.alloc(u8, meta.piece_length);
+            var p = from;
+            while (p <= last) : (p += 1) {
+                const want = meta.pieceSize(p);
+                const got = readPiece(meta, gpa, init.io, dest, p, buf[0..want]) catch "";
+                meta.verify(p, got) catch {
+                    bad += 1;
+                    std.debug.print("  piece {d}: BAD\n", .{p});
+                };
+            }
+            std.debug.print("{d} pieces checked, {d} bad\n", .{ last - from + 1, bad });
+            return if (bad == 0) {} else error.Corrupt;
+        }
+
+        if (!std.mem.eql(u8, verb, "fetch") and !std.mem.eql(u8, verb, "run") and
+            !std.mem.eql(u8, verb, "install"))
+        {
+            std.debug.print("{s}", .{usage});
+            return error.Usage;
+        }
+
+        var done: usize = 0;
+        var failed: usize = 0;
+        var resumed: usize = 0;
+
+        // Pieces are fetched in a random order rather than 0,1,2,... — that is what the CDN
+        // expects to see, and it spreads a resumed download instead of replaying one region.
+        const order = try gpa.alloc(usize, last - from + 1);
+        for (order, 0..) |*o, k| o.* = from + k;
+        if (!sequential) {
+            // Seeded from the clock, the same way the client seeds the rand() behind its shuffle,
+            // so consecutive runs do not repeat an order.
+            const now = std.Io.Timestamp.now(init.io, .real);
+            var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(now.nanoseconds))));
+            prng.random().shuffle(usize, order);
+        }
+
+        // Each piece allocates a body, a URL and a span list. Without a reset they accumulate to
+        // the size of the payload, which for these is well over a gigabyte.
+        var scratch_state = std.heap.ArenaAllocator.init(gpa);
+        defer scratch_state.deinit();
+
+        // The map only makes sense on a terminal; piped or in CI it would be a wall of escapes.
+        const tty = (std.Io.File.stderr().isTty(init.io) catch false);
+        var grid: ?Grid = if (tty) try Grid.init(gpa, init.io, last - from + 1) else null;
+
+        // Several pieces at once. The real client does the same, governed by its maxpending and
+        // maxsimultaneous settings; neither it nor this caps the download rate itself.
+        var shared: Fetch = .{
+            .meta = meta,
+            .order = order,
+            .from = from,
+            .last = last,
+            .dest = dest,
+            .retries = retries,
+            .grid = if (grid) |*g| g else null,
+        };
+
+        {
+            const workers = try gpa.alloc(std.Thread, jobs);
+            defer gpa.free(workers);
+            var spawned: usize = 0;
+            for (workers) |*t| {
+                t.* = std.Thread.spawn(.{}, Fetch.work, .{&shared}) catch break;
+                spawned += 1;
+            }
+            // If no thread could start, do the work here rather than silently finishing early.
+            if (spawned == 0) Fetch.work(&shared) else for (workers[0..spawned]) |t| t.join();
+        }
+
+        done = shared.done;
+        failed = shared.failed;
+        resumed = shared.resumed;
+        if (shared.gave_up) {
+            if (grid) |*g| g.draw(done, failed, true);
+            std.debug.print("\n{d} pieces failed and none succeeded.\n" ++
+                "A 403 here usually means the stub's access token has expired; fetch a fresh\n" ++
+                "stub by asking for the product code, or pass --cookie. See the README.\n", .{failed});
+            return error.AllPiecesFailed;
+        }
+
         if (grid) |*g| g.draw(done, failed, true);
-        std.debug.print("\n{d} pieces failed and none succeeded.\n" ++
-            "A 403 here usually means the stub's access token has expired; fetch a fresh\n" ++
-            "stub by asking for the product code, or pass --cookie. See the README.\n", .{failed});
-        return error.AllPiecesFailed;
-    }
+        if (resumed != 0)
+            std.debug.print("\n{d} pieces written, {d} already had, {d} failed -> {s}/{s}\n", .{ done - resumed, resumed, failed, dir_path, meta.name })
+        else
+            std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
 
-    if (grid) |*g| g.draw(done, failed, true);
-    if (resumed != 0)
-        std.debug.print("\n{d} pieces written, {d} already had, {d} failed -> {s}/{s}\n", .{ done - resumed, resumed, failed, dir_path, meta.name })
-    else
-        std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
-
-    if (std.mem.eql(u8, verb, "run")) {
-        // The client announces exactly twice, started and stopped, and the second one claims
-        // the download finished whether it did or not.
-        if (!no_tracker and meta.announce.len != 0) {
-            const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
-            const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .stopped);
-            std.debug.print("8  tracker       event=stopped\n", .{});
-            if (fetchUrl(gpa, &client, url)) |_| {} else |_| {}
-        } else {
-            std.debug.print("8  tracker       skipped\n", .{});
+        if (std.mem.eql(u8, verb, "run")) {
+            // The client announces exactly twice, started and stopped, and the second one claims
+            // the download finished whether it did or not.
+            if (!no_tracker and meta.announce.len != 0) {
+                const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
+                const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .stopped);
+                std.debug.print("8  tracker       event=stopped\n", .{});
+                if (fetchUrl(gpa, &client, url)) |_| {} else |_| {}
+            } else {
+                std.debug.print("8  tracker       skipped\n", .{});
+            }
+            // The client would run this itself. Printing it is as far as this goes: fetching a
+            // payload is one thing, executing it unasked is another.
+            std.debug.print("9  launch target {s}/{s}  (not run)\n", .{ dir_path, meta.launch_target });
         }
-        // The client would run this itself. Printing it is as far as this goes: fetching a
-        // payload is one thing, executing it unasked is another.
-        std.debug.print("9  launch target {s}/{s}  (not run)\n", .{ dir_path, meta.launch_target });
-    }
 
-    if (failed != 0) return error.Incomplete;
+        if (failed != 0) return error.Incomplete;
+
+        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language);
+    } // end of the per-product loop
 }
 
+/// Build the game directory from a payload that has just been fetched.
+///
+/// The payload's archives hold both the files and the script saying where they go. Everything the
+/// script asks for that has meaning off Windows is done; the registry keys, shortcuts and DirectX
+/// bundle it also asks for are counted and reported instead.
+fn install(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    payload: []const u8,
+    game: []const u8,
+    platform: []const u8,
+    language: []const u8,
+) !void {
+    // The script names its own archives Tome1..Tome6; a payload has one of them, or a few.
+    var set: mpq.Set = .{};
+    defer set.deinit(gpa);
+    var found: usize = 0;
+    for (0..6) |n| {
+        const name = if (n == 0)
+            try std.fmt.allocPrint(gpa, "{s}/Installer Tome.mpq", .{payload})
+        else
+            try std.fmt.allocPrint(gpa, "{s}/Installer Tome {d}.mpq", .{ payload, n + 1 });
+        const bytes = readFile(gpa, io, name) catch continue;
+        set.add(gpa, bytes) catch continue;
+        found += 1;
+    }
+    if (found == 0) {
+        std.debug.print("no Installer Tome in {s}\n", .{payload});
+        return error.NoTome;
+    }
+
+    const manifest = set.read(gpa, script.manifest_path) catch {
+        std.debug.print("the payload carries no install script\n", .{});
+        return error.NoManifest;
+    };
+    // An expansion installs over the base game, and deletes from where it already sits.
+    const original = try std.fmt.allocPrint(gpa, "{s}/", .{game});
+    const plan = try script.parse(gpa, manifest, .{
+        .platform = if (std.mem.eql(u8, platform, "macos")) .macos else .win32,
+        .language = language,
+        .symbols = &.{.{ .name = "OriginalInstallPath", .value = original }},
+    });
+
+    std.debug.print("\ninstalling {d} operations from {d} archive(s) -> {s}\n", .{ plan.ops.len, found, game });
+    try mkdirs(io, game);
+
+    var wrote: usize = 0;
+    var added: usize = 0;
+    var elsewhere: usize = 0;
+    var pending: std.ArrayList(@TypeOf(@as(script.Op, undefined).add_to_archive)) = .empty;
+
+    for (plan.ops) |op| switch (op) {
+        .extract => |f| {
+            const from = f.from orelse continue;
+            const data = set.read(gpa, from) catch continue;
+            defer gpa.free(data);
+            const rel = try gpa.dupe(u8, f.to);
+            defer gpa.free(rel);
+            for (rel) |*c| if (c.* == '\\') {
+                c.* = '/';
+            };
+            const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
+            defer gpa.free(full);
+            if (std.mem.lastIndexOfScalar(u8, full, '/')) |cut| try mkdirs(io, full[0..cut]);
+            try writeWhole(io, full, data);
+            wrote += 1;
+        },
+        .add_to_archive => |a| try pending.append(gpa, a),
+        .delete => |path| {
+            const rel = try gpa.dupe(u8, path);
+            defer gpa.free(rel);
+            for (rel) |*c| if (c.* == '\\') {
+                c.* = '/';
+            };
+            const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
+            defer gpa.free(full);
+            Dir.cwd().deleteFile(io, full) catch {};
+            std.debug.print("  replacing {s}\n", .{rel});
+        },
+        else => elsewhere += 1,
+    };
+
+    // One rewrite per archive, carrying every member bound for it.
+    var done_containers: std.StringHashMapUnmanaged(void) = .empty;
+    for (pending.items) |a| {
+        if (done_containers.contains(a.container)) continue;
+        try done_containers.put(gpa, a.container, {});
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, a.container });
+        defer gpa.free(path);
+        const before = readFile(gpa, io, path) catch continue;
+        defer gpa.free(before);
+
+        var add: std.ArrayList(mpq.NewFile) = .empty;
+        defer add.deinit(gpa);
+        for (pending.items) |b| {
+            if (!std.mem.eql(u8, b.container, a.container)) continue;
+            const from = b.file.from orelse continue;
+            const data = set.read(gpa, from) catch continue;
+            try add.append(gpa, .{ .name = b.file.to, .data = data });
+        }
+        const grown = mpq.append(gpa, before, add.items) catch continue;
+        defer gpa.free(grown);
+        try writeWhole(io, path, grown);
+        added += add.items.len;
+    }
+
+    std.debug.print("{d} files, {d} members added to installed archives, {d} steps only Windows can do\n" ++
+        "the game is in {s}\n", .{ wrote, added, elsewhere, game });
+}
 
 /// A piece map, the way a torrent client draws one: a grid of cells, each standing for a run of
 /// pieces, filling in as they arrive. Because pieces are fetched in a random order the map fills
@@ -621,7 +790,6 @@ const Grid = struct {
         std.debug.print("{s}", .{w.buffered()});
     }
 };
-
 
 /// The shared state a set of fetch workers pulls from. Counters are atomic and the piece cursor
 /// is a fetch-and-add, so a worker only ever needs the next index and never waits on the others.
@@ -733,8 +901,7 @@ const Fetch = struct {
     }
 
     fn finish(f: *Fetch, piece: usize, ok: bool, io: std.Io) void {
-        if (ok) _ = @atomicRmw(usize, &f.done, .Add, 1, .monotonic)
-        else _ = @atomicRmw(usize, &f.failed, .Add, 1, .monotonic);
+        if (ok) _ = @atomicRmw(usize, &f.done, .Add, 1, .monotonic) else _ = @atomicRmw(usize, &f.failed, .Add, 1, .monotonic);
 
         const done = @atomicLoad(usize, &f.done, .monotonic);
         const failed = @atomicLoad(usize, &f.failed, .monotonic);

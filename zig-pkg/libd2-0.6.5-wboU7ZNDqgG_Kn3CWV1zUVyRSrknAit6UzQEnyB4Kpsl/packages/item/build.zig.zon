@@ -1,0 +1,16 @@
+.{
+    .name = .d2_item,
+    .version = "0.6.5",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x2f3bb33652303552,
+
+    // The shared Stat/Item model foundation (seed-RNG, ISC, wire item decoder)
+    // lives in d2-core; items re-exports those so its public API is unchanged.
+    .dependencies = .{
+        .d2_core = .{ .path = "../core" },
+        .d2_data = .{ .path = "../data" },
+        .d2_util = .{ .path = "../util" },
+    },
+
+    .paths = .{"."},
+}

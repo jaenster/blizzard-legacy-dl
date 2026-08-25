@@ -1,0 +1,2525 @@
+//! Gate-safe POST-generation tile materialization consumer (Milestone 2a).
+//!
+//! This is the orchestration layer that turns a room's DS1/DrlgMap grid cells
+//! into its actual tile-data list (floors / walls / shadows), by faithfully
+//! transforming the reconstructed 1.14d path:
+//!
+//!   DS1 layers ──▶ D2DrlgGridStrc sub-grids  (Preset::InitGridsFromDS1File +
+//!                                              DrlgGrid::InitGridFromTileData)
+//!             ──▶ CountTilesFromGrid / CountWallTilesFromGrid  (size the arrays)
+//!             ──▶ AllocTileDataArrays
+//!             ──▶ InitRoomTiles ─▶ processTile ─▶ the tilegen.zig tile BUILDERS
+//!                                  (getTileLibraryEntry / fillTileData /
+//!                                   create{Wall,Floor,Shadow}TileData).
+//!
+//! The count / InitRoomTiles / processTile bodies are 1:1 transforms of
+//! recon/closure/RoomTile.cpp (see RoomTile.zig for the same functions on the
+//! free path). The grid setup mirrors Preset.cpp DRLGPRESET_InitGridsFromDS1File
+//! (006667d0) collapsed to a single whole-room grid per layer: InitGridFromTileData
+//! just points a sub-grid's pCellsFlags at the parent layer cells with a
+//! row-offset table, which for a whole room is `pCellsFlags = layer,
+//! rowOffsets[y] = y*stride`.
+//!
+//! ARTIFACT-BLOCKED corners (documented, mirrors RoomTile.zig's panic stubs):
+//!   * setupWarpTile / initWarpCacheTiles / updateOrAddTile / updateTileType are
+//!     artifact-blocked in the recon (uninit locals, lost params, truncated
+//!     tables). processTile reaches them only for WARP / PRESET-SPAWN / cross-room
+//!     TRANSITION cells (orientation 8/9/10/11 with the 0x80000000 grid bit, or
+//!     the 0x04 transition bit). These produce warp *units* / preset spawns / room
+//!     seams — NOT base collision floor/wall tiles — so this consumer counts them
+//!     (`special_excluded`) and skips them, exactly like M1 excluded the type-3
+//!     shadow companions. The cross-check masks those tile positions.
+//!   * The 0x04 transition bit does not occur in the shipped preset DS1s (verified
+//!     empirically); its branch is a counted skip.
+//!
+//! GATE SAFETY: pure post-generation CONSUMER. Nothing here is imported by the
+//! generation path (drlg.zig / InitLevel / InitAllRoomsEx); only tests import it.
+//! It runs on a bare, throwaway room over a COPY of the room seed, so the
+//! byte-exact seed gate is never touched.
+
+const std = @import("std");
+const s = @import("structs.zig");
+const tables = @import("tables.zig");
+const DrlgGrid = @import("DrlgGrid.zig");
+const DrlgRoom = @import("DrlgRoom.zig");
+const Border = @import("outdoors/Border.zig");
+const tilegen = @import("tilegen.zig");
+const dt1 = @import("d2-formats").dt1;
+const ds1 = @import("d2-formats").ds1;
+const collision = @import("../collision.zig");
+const lib = @import("../lib.zig");
+const dt1blob = @import("d2-formats").dt1_blob;
+const dt1_data = @import("d2-formats").dt1_data;
+const preset = @import("preset.zig");
+const dpool = @import("pool.zig");
+const dtables = @import("tables.zig");
+const drlgmod = @import("drlg.zig");
+const act_mod = @import("../act.zig");
+const fog = @import("d2-core").memory;
+const TileSub = @import("TileSub.zig");
+
+/// Reusable per-room transient scratch. These builders used to nest a fresh ArenaAllocator in
+/// the caller's allocator, which on the render path IS an arena — so `deinit` handed the pages
+/// back to a no-op free and every room grew the level arena by a fresh set of pages instead of
+/// reusing the previous room's. One arena per call site, reset on entry, reuses them. Resetting
+/// on ENTRY rather than freeing on exit only ever extends a lifetime, never shortens one.
+fn roomScratch(slot: *?std.heap.ArenaAllocator) std.mem.Allocator {
+    if (slot.* == null) slot.* = std.heap.ArenaAllocator.init(dpool.default_allocator);
+    _ = slot.*.?.reset(.retain_capacity);
+    return slot.*.?.allocator();
+}
+
+threadlocal var scratch_ds1: ?std.heap.ArenaAllocator = null;
+threadlocal var scratch_outdoor_room: ?std.heap.ArenaAllocator = null;
+threadlocal var scratch_outdoor_tiles: ?std.heap.ArenaAllocator = null;
+
+const drlg_rng = @import("rng.zig");
+
+const SUBTILES = collision.SUBTILES_PER_TILE;
+
+// eD2GridCellFlags bit constants (RoomTile.cpp naming).
+const CELLFLAGS_NONE: i32 = 0;
+const CELLFLAGS_0x01: i32 = 0x01;
+const CELLFLAGS_0x02: i32 = 0x02;
+const CELLFLAGS_0x04: i32 = 0x04;
+const CELLFLAGS_0x08: i32 = 0x08;
+const CELLFLAGS_0x80: i32 = 0x80;
+const CELLFLAGS_0x8000000: i32 = 0x8000000;
+const CELLFLAGS_0x80000000: i32 = @bitCast(@as(u32, 0x80000000));
+
+// ---------------------------------------------------------------------------
+// Consumer context: the tile-position bookkeeping the recon path never needs
+// (it feeds a real engine), but the collision cross-check does. Test-only,
+// single-threaded: set before an InitRoomTiles run, read after.
+// ---------------------------------------------------------------------------
+/// Cross-room tile index backing the engine's UpdateOrAddTile path
+/// (RoomTile.cpp FindTileInNearRooms 0x66e580 -> FindTileAtPosition 0x66e4c0).
+/// DRLGPRESET_InitGridsFromDS1File ORs 0x84 into every BORDER cell of a preset
+/// room's wall/floor/cell grids, so every cell on the room's ring carries
+/// CELLFLAGS_0x04 and routes through UpdateOrAddTile: if an ALREADY-BUILT near
+/// room owns a tile at that world position the engine updates it in place —
+/// creating no tile here and consuming no rarity roll. Rooms sharing a border
+/// therefore emit the seam tile exactly once, and the receiving room's seed
+/// stream stays aligned. The caller populates this after each room is done
+/// (FindTileInNearRooms skips the searching room itself).
+/// Debug-dump print that compiles to nothing off-native — freestanding wasm has no
+/// stderr, and a live std.debug.print here would drag std.Io.Threaded into the
+/// libc-free build (see tilegen.zig's copy).
+inline fn dprint(comptime fmt: []const u8, args: anytype) void {
+    if (comptime @import("builtin").target.os.tag != .freestanding) std.debug.print(fmt, args);
+}
+
+/// AutoContext hashes an integer key with wyhash, which is several multiplies and rounds of
+/// mixing. These keys are packed world coordinates probed once per placed tile — the hottest
+/// map in the collision build — and a multiply-shift spreads them just as well. Nothing
+/// iterates these maps, so the bucket order this changes is unobservable.
+const TileKeyContext = struct {
+    pub fn hash(_: TileKeyContext, k: u64) u64 {
+        var h = k *% 0x9E3779B97F4A7C15;
+        h ^= h >> 29;
+        return h;
+    }
+    pub fn eql(_: TileKeyContext, a: u64, b: u64) bool {
+        return a == b;
+    }
+};
+
+pub const NearTileIndex = struct {
+    /// One already-built room, kept alive past its own materialization: the engine's
+    /// UpdateTileType re-resolve rolls on the OWNER room's seed and resolves in the
+    /// OWNER's tile library, so both have to outlive the room that produced them.
+    pub const Owner = struct {
+        dts: []const dt1.Dt1,
+        seed: s.D2SeedStrc,
+        rect: Rect,
+    };
+    owners: std.ArrayListUnmanaged(Owner) = .empty,
+    /// key = world tile (x,y) + link class; value = the owning tile's identity bits.
+    map: std.HashMapUnmanaged(u64, Entry, TileKeyContext, 80) = .empty,
+    /// Seam hits where UpdateTileType's bNeedUpdate fired: the owner's tile is a
+    /// FLOOR carrying the Blank (main 30, sub 0) entry, so the engine re-resolves it
+    /// against the VISITING room's grid flags and swaps the owner tile's library
+    /// entry — the owner's solid-rock blank stops being solid rock. Recorded here so
+    /// the caller can apply it to the owner's already-collected tile list.
+    blank_replaced: std.HashMapUnmanaged(u64, Swap, TileKeyContext, 80) = .empty,
+    patch_alloc: std.mem.Allocator = undefined,
+
+    pub const Entry = struct { n_tile_type: i32, n_flags: i32, ox: i32, oy: i32, ow: i32, oh: i32, is_blank: bool = false, owner_idx: usize = 0 };
+
+    /// gnRoomTileMappingByTypeAndLayer (Game.exe 1.14d @0x6ef620): visiting LAYER ->
+    /// transition-table row. -1 keeps the layer as-is, -2 aborts the update entirely.
+    const kMappingByLayer = [20]i32{ -1, 0, 1, 2, -1, 3, 4, 5, -2, -2, -1, -1, -1, -2, -1, -1, -1, -1, -1, -1 };
+    /// gnRoomTileMappingTransitionByType (@0x6ef574): [row * 7 + existing nTileType] ->
+    /// the layer the owner's tile is re-typed to. Six rows of seven, plus a lone 7th.
+    const kMappingTransition = [43]i32{
+        0, 1, 3, 3, 4, 1, 3,
+        1, 1, 2, 3, 4, 3, 2,
+        2, 3, 3, 3, 4, 3, 3,
+        3, 1, 3, 3, 4, 5, 6,
+        1, 3, 2, 3, 4, 3, 6,
+        2, 1, 2, 3, 4, 1, 2,
+        7,
+    };
+
+    /// The layer DRLGROOMTILE_UpdateTileType (0x66e740) settles on for the owner's tile,
+    /// or null when it returns without touching it. `visit_layer` is the layer the seam
+    /// cell asked for, `held` the type the owner's tile currently carries.
+    fn resolveLayer(visit_layer: i32, held: i32, held_flags: i32, gf: i32, searcher: Rect, ox: i32, oy: i32, wx: i32, wy: i32) ?i32 {
+        // nFlags bit 0 (grid flag 0x80) pins the tile: only wall types 8/9 get their draw
+        // flags recomputed, and the library entry is never swapped.
+        if (held_flags & 1 != 0) return if (held == 8 or held == 9) held else null;
+        if (gf & 0x80 == 0) {
+            // Wall types 8/9 on a room's top/left edge skip the mapping and keep the layer.
+            const edge_skip = (visit_layer == 8 or visit_layer == 9) and (wx == searcher.x or wy == searcher.y);
+            if (!edge_skip) {
+                if ((held == 8 or held == 9) and (wx == ox or wy == oy)) return null;
+                const row = if (visit_layer >= 0 and visit_layer < kMappingByLayer.len) kMappingByLayer[@intCast(visit_layer)] else -1;
+                if (row < 0 or held > 7) {
+                    if (row != -1) return null;
+                } else {
+                    return kMappingTransition[@intCast(row * 7 + held)];
+                }
+            }
+        }
+        return visit_layer;
+    }
+
+    fn key(wx: i32, wy: i32, floor_link: bool) u64 {
+        return (@as(u64, @as(u32, @bitCast(wx))) << 33) | (@as(u64, @as(u32, @bitCast(wy))) << 1) |
+            @intFromBool(floor_link);
+    }
+
+    pub fn deinit(self: *NearTileIndex, a: std.mem.Allocator) void {
+        self.map.deinit(a);
+        self.blank_replaced.deinit(a);
+        for (self.owners.items) |o| a.free(o.dts);
+        self.owners.deinit(a);
+    }
+
+    /// DRLGROOMTILE_UpdateTileType (0x66e740), the bNeedUpdate arm: the owner's tile is
+    /// a FLOOR carrying Blank(30,0), so the engine re-resolves it for the VISITING
+    /// room's grid flags — `GetTileLibraryEntry(pOwnerRoom, nTileLayer, nGridFlags)` —
+    /// which rolls the OWNER's seed and swaps the owner tile's library entry. Replayed
+    /// here against the owner's persisted seed + library, so the owner's stream advances
+    /// exactly as the engine's does and later re-resolves into the same room follow on.
+    fn reresolveOnOwner(self: *NearTileIndex, owner_idx: usize, n_tile_type: i32, gf: i32) ?*const dt1.Tile {
+        if (owner_idx >= self.owners.items.len) return null;
+        const o = &self.owners.items[owner_idx];
+        var tlib = tilegen.TileLib{ .dts = o.dts };
+        var room: s.D2RoomExStrc = std.mem.zeroes(s.D2RoomExStrc);
+        room.sSeed = o.seed;
+        room.apTiles[0] = @ptrCast(&tlib);
+        room.sCoords = .{ .WorldPosition = .{ .x = o.rect.x, .y = o.rect.y }, .WorldSize = .{ .x = o.rect.w, .y = o.rect.h } };
+        // The engine passes the OWNER room to GetTileLibraryEntry, so its seqtile
+        // record is attributed to the owner, not to the room that triggered it.
+        const saved_room = tilegen.probe_cur_room;
+        tilegen.probe_cur_room = .{ o.rect.x * SUBTILES, o.rect.y * SUBTILES };
+        const e = tilegen.getTileLibraryEntry(&room, n_tile_type, @bitCast(gf));
+        tilegen.probe_cur_room = saved_room;
+        o.seed = room.sSeed; // the roll is permanent on the owner's stream
+        return e;
+    }
+
+    /// The entry a seam hit re-resolved the blank floor owned at this world cell to,
+    /// or null if no hit re-typed it.
+    pub fn blankReplacement(self: *const NearTileIndex, wx: i32, wy: i32) ?Swap {
+        return self.blank_replaced.get(key(wx, wy, true));
+    }
+
+    /// Debug: trace every add/find/swap touching this one world tile cell.
+    pub var probe_cell: ?struct { x: i32, y: i32 } = null;
+
+    fn probing(wx: i32, wy: i32) bool {
+        const p = probe_cell orelse return false;
+        return p.x == wx and p.y == wy;
+    }
+
+    pub fn add(self: *NearTileIndex, a: std.mem.Allocator, wx: i32, wy: i32, n_tile_type: i32, n_flags: i32, owner: Rect, is_blank: bool, owner_idx: usize) !void {
+        // Companions (type 4) are never matched by FindTileAtPosition, so they are
+        // not owners either. First writer wins: the engine walks a room's tile list
+        // and returns the first hit.
+        if (n_tile_type == 4) return;
+        const gop = try self.map.getOrPut(a, key(wx, wy, n_tile_type == 0));
+        if (!gop.found_existing) gop.value_ptr.* = .{ .n_tile_type = n_tile_type, .n_flags = n_flags, .ox = owner.x, .oy = owner.y, .ow = owner.w, .oh = owner.h, .is_blank = is_blank, .owner_idx = owner_idx };
+        if (probing(wx, wy)) dprint("PCELL add tt={d} nflags=0x{X} owner=({d},{d} {d}x{d}) blank={} taken={}\n", .{ n_tile_type, @as(u32, @bitCast(n_flags)), owner.x, owner.y, owner.w, owner.h, is_blank, gop.found_existing });
+    }
+
+    /// FindTileAtPosition's match: same world cell, same link class, owner type != 4,
+    /// a shadow request (nGridFlags 0x8000000) only matches a shadow tile, and the
+    /// owner's layer index (nFlags bits 0x1c000, written as (layer+1)<<0xe) must
+    /// either be absent or equal the requesting cell's layer ((gf>>0x12)&3).
+    /// UpdateTileType's bNeedUpdate swap (see `blank_replaced`).
+    fn markBlankReplaced(self: *const NearTileIndex, wx: i32, wy: i32, sw: Swap) void {
+        const mut: *NearTileIndex = @constCast(self);
+        mut.blank_replaced.put(mut.patch_alloc, key(wx, wy, true), sw) catch {};
+    }
+
+    pub fn find(self: *const NearTileIndex, wx: i32, wy: i32, n_tile_type: i32, gf: i32, searcher: Rect) bool {
+        const ep = @constCast(self).map.getPtr(key(wx, wy, n_tile_type == 0)) orelse {
+            if (probing(wx, wy)) dprint("PCELL find tt={d} gf=0x{X} searcher=({d},{d} {d}x{d}) -> MISS\n", .{ n_tile_type, @as(u32, @bitCast(gf)), searcher.x, searcher.y, searcher.w, searcher.h });
+            return false;
+        };
+        const e = ep.*;
+        if (probing(wx, wy)) dprint("PCELL find tt={d} gf=0x{X} searcher=({d},{d} {d}x{d}) held={d} heldflags=0x{X} owner=({d},{d} {d}x{d}) blank={}\n", .{ n_tile_type, @as(u32, @bitCast(gf)), searcher.x, searcher.y, searcher.w, searcher.h, e.n_tile_type, @as(u32, @bitCast(e.n_flags)), e.ox, e.oy, e.ow, e.oh, e.is_blank });
+        // FindTileInNearRooms only walks ppDrlgRoomsExNear, so an owner that is not a
+        // neighbour of the searching room is invisible. Rooms are "near" when their
+        // tile rects touch (the shared seam is one tile wide).
+        if (e.ox + e.ow < searcher.x or searcher.x + searcher.w < e.ox) return false;
+        if (e.oy + e.oh < searcher.y or searcher.y + searcher.h < e.oy) return false;
+        if (e.is_blank) {
+            const mut: *NearTileIndex = @constCast(self);
+            // UpdateTileType ends in SetWallTileFlags(pTileData, tileType, ..., nGridFlags):
+            // the owner's tile keeps its identity slot but its DRAW flags are recomputed
+            // from the VISITING cell's grid flags. That is where COLLIDE_BLOCK_PLAYER comes
+            // from on a re-typed seam blank (gf 0x20000 -> nFlags 0x40 -> 0x01), so the swap
+            // has to carry the new nFlags as well as the new entry.
+            // The layer is not pinned at 0: the two mapping tables decide what the owner's
+            // tile becomes. When they land on a WALL type the owner room has no such entry
+            // and the re-resolve yields the zero-collision fallback, which is why the
+            // engine reads 0x01 on these seams where a kept Blank would read 0x05.
+            if (resolveLayer(n_tile_type, e.n_tile_type, e.n_flags, gf, searcher, e.ox, e.oy, wx, wy)) |layer| {
+                var td: s.D2DrlgTileDataStrc = std.mem.zeroes(s.D2DrlgTileDataStrc);
+                tilegen.setWallTileFlags(&td, layer, @bitCast(gf));
+                const swapped = mut.reresolveOnOwner(e.owner_idx, layer, gf);
+                mut.markBlankReplaced(wx, wy, .{
+                    .tile = swapped,
+                    .n_flags = td.nFlags,
+                    .ox = e.ox,
+                    .oy = e.oy,
+                });
+                // UpdateTileType mutates the owner's tile in place, so every LATER
+                // FindTileInNearRooms hit on this cell sees the updated type/flags — most
+                // importantly the pin bit (nFlags 0x1), which stops a second seam neighbour
+                // from re-typing it back. Without this write-back the last visitor wins and
+                // a re-typed blank reverts to solid rock.
+                ep.n_tile_type = layer;
+                ep.n_flags = td.nFlags;
+                ep.is_blank = layer == 0 and swapped != null and swapped.?.main == 30 and swapped.?.sub == 0;
+                if (probing(wx, wy)) dprint("PCELL swap layer={d} newflags=0x{X} entry={?} owner=({d},{d})\n", .{ layer, @as(u32, @bitCast(td.nFlags)), if (swapped) |t| t.main else null, e.ox, e.oy });
+            } else if (probing(wx, wy)) dprint("PCELL swap SKIPPED (resolveLayer null)\n", .{});
+        }
+        if (e.n_tile_type == 4) return false;
+        if (e.n_tile_type != 0xd and (gf & CELLFLAGS_0x8000000) != 0) return false;
+        if ((e.n_flags & 0x1c000) == 0) return true;
+        const owner_layer = (@as(u32, @bitCast(e.n_flags)) >> 0xe & 7) -% 1;
+        return owner_layer == (@as(u32, @bitCast(gf)) >> 0x12 & 3);
+    }
+};
+
+/// The engine's type-10 fallback entry: a real tile with an all-zero collision block.
+const zero_coll_tile: dt1.Tile = .{ .orientation = 10, .main = 0, .sub = 0, .rarity = 1, .flags = [_]u8{0} ** 25 };
+pub fn zeroCollisionTile() *const dt1.Tile {
+    return &zero_coll_tile;
+}
+
+pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// A re-resolved seam tile: the new entry plus the OWNER whose tile it belongs to —
+/// the engine mutates exactly that one tile, not every blank sharing the world cell.
+pub const Swap = struct { tile: ?*const dt1.Tile, n_flags: i32, ox: i32, oy: i32 };
+
+pub const LinkedTile = struct { wx: i32, wy: i32, n_tile_type: i32, n_flags: i32, is_blank: bool };
+
+/// The room's world tile origin plus the index of every tile already built by the
+/// level's earlier rooms — what FindTileInNearRooms searches.
+pub const NearRooms = struct { index: *NearTileIndex, alloc: std.mem.Allocator, wx: i32, wy: i32, w: i32, h: i32 };
+
+const MatCtx = struct {
+    width: usize,
+    /// Already-built near rooms' tiles + this room's world tile origin, for the
+    /// UpdateOrAddTile path. Null keeps the standalone (single-room) behaviour.
+    near: ?*const NearTileIndex = null,
+    link_alloc: std.mem.Allocator = undefined,
+    room_wx: i32 = 0,
+    room_wy: i32 = 0,
+    room_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// tile positions (y*width+x) diverted to the artifact-blocked warp/preset
+    /// path — excluded from the produced tiles and masked in the cross-check.
+    special: []bool,
+    /// wall-array indices that are type-3 shadow companions (createWallTileData
+    /// spawns a type-4 tile per type-3 wall; collision.zig has no companion).
+    companion: []bool,
+    special_count: usize = 0,
+    warp_setup_skipped: usize = 0,
+    transition_skipped: usize = 0,
+    /// Border cells whose tile a near room already owned (no tile, no roll here).
+    transition_updated: usize = 0,
+    /// Tiles this room created through AddTileData — the ONLY ones the engine links
+    /// into pRoomTiles->pMapLinks, and therefore the only ones FindTileAtPosition can
+    /// ever return. Published to the level index once the room is finished.
+    linked: std.ArrayListUnmanaged(LinkedTile) = .empty,
+
+    fn markSpecial(self: *MatCtx, nX: i32, nY: i32) void {
+        self.special_count += 1;
+        const ix: usize = @intCast(nX);
+        const iy: usize = @intCast(nY);
+        const k = iy * self.width + ix;
+        if (k < self.special.len and !self.special[k]) self.special[k] = true;
+    }
+};
+
+// Set at the top of each materialize entry (a poor-man's closure for the C-style tilegen
+// callbacks) and read only within that same synchronous call. Thread-local so concurrent
+// generations on different threads don't clobber each other's MatCtx (single-threaded
+// behaviour is identical — each thread still sets+reads its own).
+threadlocal var g_ctx: *MatCtx = undefined;
+
+// ===========================================================================
+// RoomTile.cpp count/init/processTile — faithful transforms wired to the
+// tilegen.zig builders (which own getTileLibraryEntry + create*TileData).
+// ---------------------------------------------------------------------------
+
+/// RoomTile.cpp:825 (0066ece0) — sizes nWall/nFloor/nRoof Tiles Max from a grid.
+fn countTilesFromGrid(pRoomEx: [*c]s.D2RoomExStrc, pGrid: [*c]s.D2DrlgGridStrc, bCountFloors: i32, bKillEdgeX_in: i32, bKillEdgeY: i32) void {
+    const nWorldPosX = pRoomEx.*.sCoords.WorldPosition.x;
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoomEx.*.pRoomTiles);
+    const nWidth = @as(i32, @intFromBool(bKillEdgeX_in == 0)) + pRoomEx.*.sCoords.WorldSize.x;
+    const nWorldPosY = pRoomEx.*.sCoords.WorldPosition.y;
+    var nRow: i32 = 0;
+    const nHeight = @as(i32, @intFromBool(bKillEdgeY == 0)) + pRoomEx.*.sCoords.WorldSize.y;
+    if (0 >= nHeight) return;
+    while (true) {
+        var nX: i32 = 0;
+        if (0 < nWidth) {
+            while (true) {
+                const nCell = DrlgGrid.GetGridFlags(pGrid, nX, nRow);
+                if ((nCell & 1) != 0) pTileGrid.*.nWallTilesMax += 1;
+                if ((nCell & 2) != 0 or (bCountFloors != 0 and DrlgRoom.AreXYInsideCoordinates(&pRoomEx.*.sCoords, nX + nWorldPosX, nRow + nWorldPosY) != 0)) {
+                    pTileGrid.*.nFloorTilesMax += 1;
+                }
+                if ((nCell & 0x8000000) != 0) pTileGrid.*.nRoofTilesMax += 1;
+                nX += 1;
+                if (!(nX < nWidth)) break;
+            }
+        }
+        nRow += 1;
+        if (!(nRow < nHeight)) break;
+    }
+}
+
+/// RoomTile.cpp:864 (0066edb0) — counts the extra wall tiles (orient 3/10/11).
+fn countWallTilesFromGrid(pRoomEx: [*c]s.D2RoomExStrc, pFloorGrid: [*c]s.D2DrlgGridStrc, pOrientGrid: [*c]s.D2DrlgGridStrc, bKillEdgeX: i32, bKillEdgeY: i32) void {
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoomEx.*.pRoomTiles);
+    const nWidth = @as(i32, @intFromBool(bKillEdgeX == 0)) + pRoomEx.*.sCoords.WorldSize.x;
+    var nY: i32 = 0;
+    const nHeight = @as(i32, @intFromBool(bKillEdgeY == 0)) + pRoomEx.*.sCoords.WorldSize.y;
+    if (0 >= nHeight) return;
+    while (true) {
+        var nColIdx: i32 = 0;
+        if (0 < nWidth) {
+            while (true) {
+                var nTileType = DrlgGrid.GetGridFlags(pOrientGrid, nColIdx, nY);
+                var bCountWall = false;
+                if (nTileType == 3) {
+                    bCountWall = true;
+                } else if (@as(u32, @bitCast(nTileType -% 10)) < 2) {
+                    nTileType = DrlgGrid.GetGridFlags(pFloorGrid, nColIdx, nY);
+                    if (-1 < nTileType) bCountWall = true else pTileGrid.*.nFloorTilesMax += 6;
+                }
+                if (bCountWall) pTileGrid.*.nWallTilesMax += 1;
+                nColIdx += 1;
+                if (!(nColIdx < nWidth)) break;
+            }
+        }
+        nY += 1;
+        if (!(nY < nHeight)) break;
+    }
+}
+
+/// RoomTile.cpp:935 (0066eea0). Allocs the zeroed tile-grid header.
+fn allocRoomTileGrid(pRoomEx: [*c]s.D2RoomExStrc, a: std.mem.Allocator) !void {
+    if (pRoomEx.*.pRoomTiles != null) return;
+    const p = try a.create(s.D2DrlgTileGridStrc);
+    @memset(@as([*]u8, @ptrCast(p))[0..@sizeOf(s.D2DrlgTileGridStrc)], 0);
+    pRoomEx.*.pRoomTiles = p;
+}
+
+/// RoomTile.cpp:947 (0066eee0). Allocs the wall/floor/roof tile-data arrays from
+/// the counted *Max fields. (Pool AllocServerMemory -> test allocator here.)
+fn allocTileDataArrays(pRoomEx: [*c]s.D2RoomExStrc, a: std.mem.Allocator) !void {
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoomEx.*.pRoomTiles);
+    if (pTileGrid.*.nFloorTilesMax != 0) {
+        const n: usize = @intCast(pTileGrid.*.nFloorTilesMax);
+        const arr = try a.alloc(s.D2DrlgTileDataStrc, n);
+        @memset(std.mem.sliceAsBytes(arr), 0);
+        pTileGrid.*.pFloorTiles = @ptrCast(arr.ptr);
+    }
+    if (pTileGrid.*.nWallTilesMax != 0) {
+        // +8 slack: SetupWarpTile Path B appends LIT stair walls the count pass
+        // never books (the engine writes them past its counted array into the
+        // Fog pool's slab rounding slack; a room has at most a few lit warps).
+        const n: usize = @as(usize, @intCast(pTileGrid.*.nWallTilesMax)) + 8;
+        const arr = try a.alloc(s.D2DrlgTileDataStrc, n);
+        @memset(std.mem.sliceAsBytes(arr), 0);
+        pTileGrid.*.pWallTiles = @ptrCast(arr.ptr);
+    }
+    if (pTileGrid.*.nRoofTilesMax != 0 and pTileGrid.*.pRoofTiles == null) {
+        const n: usize = @intCast(pTileGrid.*.nRoofTilesMax);
+        const arr = try a.alloc(s.D2DrlgTileDataStrc, n);
+        @memset(std.mem.sliceAsBytes(arr), 0);
+        pTileGrid.*.pRoofTiles = @ptrCast(arr.ptr);
+    }
+}
+
+/// RoomTile.cpp 720-724 wall block — createWallTileData + (skipped) warp setup.
+fn processWallBlock(pRoom: [*c]s.D2RoomExStrc, nX: i32, nY: i32, nFlags: i32, nOtherFlags: i32) void {
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoom.*.pRoomTiles);
+    const before: usize = @intCast(pTileGrid.*.nWalls);
+    const e = tilegen.getTileLibraryEntry(pRoom, nOtherFlags, @bitCast(nFlags));
+    _ = tilegen.createWallTileData(pRoom, null, nX, nY, @bitCast(nFlags), e, nOtherFlags);
+    // createWallTileData spawns a type-4 shadow companion for a type-3 wall.
+    var c: usize = before + 1;
+    while (c < @as(usize, @intCast(pTileGrid.*.nWalls))) : (c += 1) {
+        if (c < g_ctx.companion.len) g_ctx.companion[c] = true;
+    }
+    // DRLGROOMTILE_SetupWarpTile 0x66e260 after every type-0x0A/0x0B wall tile
+    // except on level 0x85 (Matron's Den); Path B may add the LIT stair wall.
+    if ((nOtherFlags == (CELLFLAGS_0x08 | CELLFLAGS_0x02 | CELLFLAGS_0x01) or nOtherFlags == (CELLFLAGS_0x08 | CELLFLAGS_0x02)) and pRoom.*.pLevel.?.eD2LevelId != .MatronsDen) {
+        g_ctx.warp_setup_skipped += 1;
+        setupWarpTile(pRoom, nX, nY, nFlags, nOtherFlags);
+    }
+}
+
+/// DRLGROOMTILE_SetupWarpTile 0x66e260 (disasm-decoded; the recon garbles its
+/// register/stack args). Engine args: (pWarpEntry = the just-created wall tile,
+/// gf, nTileType) on the stack + EDI = pRoomEx; the engine only reads the
+/// tile's nPosX/nPosY back, so we pass the cell's world coords directly. Flow:
+///   1. warp id = warpIds[(gf>>0x14)&0x3f]; find the room's warp node whose
+///      LvlWarp row Id matches (chain root pRoomEx.pTileGrid, next at +4, row
+///      handle at +0x10; the engine HALTS 0x2b1 on a miss).
+///   2. orientation byte (gf>>8) 0 or 4 -> CreateExitWarp 0x66e1c0 first: the
+///      UNIT_WARP preset spawn is collision-neutral, but its FAILURE aborts
+///      SetupWarpTile entirely (no direction set, no Path B): no LvlWarp setup
+///      row for the tile-type direction (0x0A->'l' 0x6c, 0x0B->'r' 0x72), or
+///      the cell sits on the room's far-edge ring (room-relative x ==
+///      WorldSize.x or y == WorldSize.y).
+///   3. SetWarpTileDirection(node, nTileType); the engine then links the base
+///      wall tile into the node's tile list (collision-neutral, skipped).
+///   4. Path B: if the (direction-adjusted) row's LitVersion != 0, re-resolve
+///      gf' = (row.Tiles << 8) | gf with a NORMAL rarity roll and create a
+///      SECOND wall tile at the same cell, nFlags |= 8. (The engine writes it
+///      past the counted wall array into Fog-pool slab slack; our arrays carry
+///      explicit slack — see allocTileDataArrays.)
+fn setupWarpTile(pRoom: [*c]s.D2RoomExStrc, nX: i32, nY: i32, nFlags: i32, nOtherFlags: i32) void {
+    const pWarpIds = DrlgRoom.getWarpsIdIfExists(pRoom.*.pLevel.?.pDrlg, pRoom.*.pLevel.?.eD2LevelId);
+    const nWarpIdx: u8 = @intCast((@as(u32, @bitCast(nFlags)) >> 0x14) & 0x3f);
+    const nDestId = pWarpIds[nWarpIdx];
+
+    var node: [*c]s.D2DrlgTileGridStrc = @ptrCast(@alignCast(pRoom.*.pTileGrid));
+    while (node != null) : (node = @ptrCast(@alignCast(node.*.pAnimTiles))) {
+        const row = tables.lvlWarpRowAt(node.*.nShadows) orelse continue;
+        if (row.Id == nDestId) break;
+    }
+    if (node == null) return; // engine: halt 0x2b1 (unreachable in shipped data)
+
+    const nOrientation: u8 = @truncate(@as(u32, @bitCast(nFlags)) >> 8);
+    if (nOrientation == 0 or nOrientation == 4) {
+        const dir: u8 = if (nOtherFlags != 0x0b) 0x6c else 0x72;
+        if (DrlgRoom.getWarpsIdIfExistsAndSetup(pRoom.*.pLevel, nWarpIdx, dir) == 0) return;
+        const rx = nX - pRoom.*.sCoords.WorldPosition.x;
+        const ry = nY - pRoom.*.sCoords.WorldPosition.y;
+        if (rx == pRoom.*.sCoords.WorldSize.x or ry == pRoom.*.sCoords.WorldSize.y) return;
+    }
+
+    setWarpTileDirection(node, nOtherFlags);
+    const row = tables.lvlWarpRowAt(node.*.nShadows) orelse return;
+    if (row.LitVersion == 0) return;
+
+    const gf: u32 = (@as(u32, @bitCast(row.Tiles)) << 8) | @as(u32, @bitCast(nFlags));
+    const e = tilegen.getTileLibraryEntry(pRoom, nOtherFlags, gf);
+    const t = tilegen.createWallTileData(pRoom, null, nX, nY, gf, e, nOtherFlags);
+    t.nFlags |= 8;
+}
+
+/// RoomTile.cpp 730-731 shadow block.
+fn processShadowBlock(pRoom: [*c]s.D2RoomExStrc, nX: i32, nY: i32, nFlags: i32) void {
+    const e = tilegen.getTileLibraryEntry(pRoom, 0xd, @bitCast(nFlags));
+    _ = tilegen.createShadowTileData(pRoom, null, nX, nY, @bitCast(nFlags), e);
+}
+
+// The warp-tile system (the engine's trailing per-room floor lookups).
+//
+// DRLGROOMEX_AllocRoomTile 0x66be10 hangs warp NODES off RoomEx+0x4C during the
+// act warp-graph build (our DrlgRoom.allocRoomTile): node+0x10 holds the LvlWarp
+// row TXT_LvlWarp_Setup(warpIds[visSlot], 'b') resolved — we store its 1-based
+// row index in the aliased nShadows slot. ProcessTile's bit31 marker branch
+// (orient 0x0A/0x0B, main<=7) then runs CreateExitWarp (spawns the UNIT_WARP
+// preset unit only — no tiles, no rolls; skipped here) + InitWarpCacheTiles
+// 0x66e360, which is the collision-relevant part ported below.
+
+/// gaWarpTileOffsetX/Y @ 0x6ef554 (live-read, interleaved X,Y dword pairs):
+/// the 4 warp floor tiles tile the 2x2 block whose far corner is the marker.
+const WARP_TILE_OFF_X = [4]i32{ 0, 1, 0, 1 };
+const WARP_TILE_OFF_Y = [4]i32{ 0, 0, 1, 1 };
+
+/// DRLGROOMTILE_SetWarpTileDirection 0x66e160 on a warp node: keep the cached
+/// LvlWarp row if its Direction is 'b' (0x62); otherwise re-run TXT_LvlWarp_Setup
+/// with the direction implied by the marker's orientation (GetWarpDirectionByte
+/// 0x66e150: orient != 0x0B -> 'l' 0x6c, else 'r' 0x72).
+fn setWarpTileDirection(node: [*c]s.D2DrlgTileGridStrc, nOrientFlags: i32) void {
+    const row = tables.lvlWarpRowAt(node.*.nShadows) orelse return;
+    const cur: u8 = @truncate(@as(u32, @bitCast(row.Direction)));
+    if (cur == 0x62) return;
+    const wanted: u8 = if (nOrientFlags != 0x0b) 0x6c else 0x72;
+    if (cur == wanted) return;
+    node.*.nShadows = tables.lvlWarpSetupIndex(row.Id, wanted);
+}
+
+/// DRLGROOMTILE_InitWarpCacheTiles 0x66e360 — collision-relevant core. Finds the
+/// room's warp node whose LvlWarp row Id matches the marker's warp id
+/// (warpIds[(gf>>20)&0x3f]); if the (direction-adjusted) row has LitVersion != 0,
+/// creates 4 floor tiles with synthetic grid words ((sub<<12)|i|4)<<8 at the 2x2
+/// block (nX-1..nX, nY-1..nY), each resolved via the normal rarity roll and
+/// tagged nFlags|=8. The engine's final pass only rewires the node's tile lists
+/// (no collision effect) and is skipped. The +6 floor-slot budget the count pass
+/// reserves for negative orient-10/11 cells covers these appends.
+fn initWarpCacheTiles(pRoom: [*c]s.D2RoomExStrc, nFlags: i32, nX: i32, nY: i32, nOrientFlags: i32) void {
+    const pWarpIds = DrlgRoom.getWarpsIdIfExists(pRoom.*.pLevel.?.pDrlg, pRoom.*.pLevel.?.eD2LevelId);
+    const nDestId = pWarpIds[@intCast((@as(u32, @bitCast(nFlags)) >> 0x14) & 0x3f)];
+
+    var node: [*c]s.D2DrlgTileGridStrc = @ptrCast(@alignCast(pRoom.*.pTileGrid));
+    while (node != null) : (node = @ptrCast(@alignCast(node.*.pAnimTiles))) {
+        const row = tables.lvlWarpRowAt(node.*.nShadows) orelse continue;
+        if (row.Id == nDestId) break;
+    }
+    if (node == null) return;
+
+    setWarpTileDirection(node, nOrientFlags);
+    const row = tables.lvlWarpRowAt(node.*.nShadows) orelse return;
+    if (row.LitVersion == 0) return;
+
+    const nSub: u32 = (@as(u32, @bitCast(nFlags)) >> 8) & 0xff;
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        const gf: u32 = ((nSub << 0xc) | i | 4) << 8;
+        const e = tilegen.getTileLibraryEntry(pRoom, 0, gf);
+        const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoom.*.pRoomTiles);
+        const n = pTileGrid.*.nFloors;
+        const pFloor: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(pTileGrid.*.pFloorTiles.?));
+        pFloor[@intCast(n)].pNext = null;
+        pTileGrid.*.nFloors += 1;
+        tilegen.fillTileData(pRoom, &pFloor[@intCast(n)], nX - 1 + WARP_TILE_OFF_X[i], nY - 1 + WARP_TILE_OFF_Y[i], gf, e);
+        pFloor[@intCast(n)].nFlags |= 8;
+    }
+}
+
+/// RoomTile.cpp:666 (0066e9b0). Faithful, with the artifact-blocked warp/preset/
+/// transition branches replaced by counted skips (see file header).
+fn processTile(nFlags_in: i32, pRoom: [*c]s.D2RoomExStrc, nX: i32, nY: i32, nParam: i32, nOtherFlags: i32) void {
+    tilegen.probe_cur_cell = .{ nX, nY };
+    var nFlags = nFlags_in;
+    var nGridFlags: i32 = undefined;
+    const nMainIndex: u8 = @as(u8, @truncate(@as(u32, @bitCast(nFlags)) >> 0x14)) & 0x3f;
+    if ((nOtherFlags == (CELLFLAGS_0x08 | CELLFLAGS_0x02 | CELLFLAGS_0x01) or nOtherFlags == (CELLFLAGS_0x08 | CELLFLAGS_0x02)) and 7 < nMainIndex) {
+        return;
+    }
+    const nOrientation: u8 = @truncate(@as(u32, @bitCast(nFlags >> 8)));
+    if (nOtherFlags == CELLFLAGS_NONE and nMainIndex == 0x1e and (nOrientation == 0 or nOrientation == 1)) {
+        nFlags |= CELLFLAGS_0x80000000;
+    }
+    if ((nFlags & CELLFLAGS_0x80000000) != CELLFLAGS_NONE) {
+        switch (nOtherFlags) {
+            CELLFLAGS_0x08, CELLFLAGS_0x08 | CELLFLAGS_0x01 => {
+                // RoomTile.cpp 690-698: levels 0x6f/0x70/0x75 (Act-5 Barricade 1/2 +
+                // Barricade Snow) fall through — their orient-8/9 preset markers are
+                // real tower walls, processed as normal cells. Everywhere else:
+                // Preset::CreatesPresets — preset spawn, no base collision tile.
+                const lvl: i32 = @intFromEnum(pRoom.*.pLevel.?.eD2LevelId);
+                if (lvl < 0x6f or (lvl > 0x70 and lvl != 0x75)) {
+                    g_ctx.markSpecial(nX, nY);
+                    // Preset::CreatesPresets — the spawn is collision-neutral,
+                    // but tomb shrine markers (object ids 0x5b/0x5c) consume a
+                    // room-seed roll; nSub = (marker type == 9).
+                    tilegen.createsPresetsRoll(pRoom, @bitCast(nFlags), nX, nY, nOtherFlags == (CELLFLAGS_0x08 | CELLFLAGS_0x01));
+                    return;
+                }
+            },
+            CELLFLAGS_0x08 | CELLFLAGS_0x02, CELLFLAGS_0x08 | CELLFLAGS_0x02 | CELLFLAGS_0x01 => {
+                if (7 < nMainIndex) return;
+                // createExitWarp spawns the UNIT_WARP preset unit only (no tiles,
+                // no rolls) — skipped. initWarpCacheTiles creates the 4 warp floor
+                // tiles (collision + rolls) — ported.
+                g_ctx.markSpecial(nX, nY);
+                initWarpCacheTiles(pRoom, nFlags, nX, nY, nOtherFlags);
+                return;
+            },
+            else => {},
+        }
+    }
+    if ((nFlags & CELLFLAGS_0x04) != CELLFLAGS_NONE) {
+        // DRLGROOMTILE_UpdateOrAddTile (0x66e940). The border ring set by
+        // InitGridsFromDS1File's FlagOperations(grid, OR, 0x84) lands every seam cell
+        // here: an already-built near room that owns the tile wins (no tile, no roll),
+        // otherwise AddTileData creates it in this room exactly as the direct path would.
+        if ((nFlags & CELLFLAGS_0x02) != CELLFLAGS_NONE) {
+            updateOrAddTile(pRoom, 0, nX, nY, nFlags);
+            return;
+        }
+        if ((nFlags & CELLFLAGS_0x01) != CELLFLAGS_NONE) {
+            updateOrAddTile(pRoom, nOtherFlags, nX, nY, nFlags);
+            return;
+        }
+        if ((nFlags & CELLFLAGS_0x8000000) != 0 and (nFlags & CELLFLAGS_0x80000000) == 0) {
+            updateOrAddTile(pRoom, 0xd, nX, nY, nFlags);
+            return;
+        }
+    }
+    if ((nFlags & CELLFLAGS_0x02) == CELLFLAGS_NONE) {
+        if (nParam == 0) {
+            if ((nFlags & CELLFLAGS_0x01) != CELLFLAGS_NONE) processWallBlock(pRoom, nX, nY, nFlags, nOtherFlags);
+            if ((nFlags & CELLFLAGS_0x8000000) == CELLFLAGS_NONE) return;
+            processShadowBlock(pRoom, nX, nY, nFlags);
+            return;
+        }
+        const bInside = DrlgRoom.AreXYInsideCoordinates(&pRoom.*.sCoords, nX, nY);
+        if (bInside == 0) {
+            if ((nFlags & CELLFLAGS_0x01) != CELLFLAGS_NONE) processWallBlock(pRoom, nX, nY, nFlags, nOtherFlags);
+            if ((nFlags & CELLFLAGS_0x8000000) == CELLFLAGS_NONE) return;
+            processShadowBlock(pRoom, nX, nY, nFlags);
+            return;
+        }
+        nGridFlags = (nFlags & ~CELLFLAGS_0x80) | CELLFLAGS_0x80000000;
+        const nBlank: u32 = if (pRoom.*.pLevel.?.eD2LevelId == .ArcaneSanctuary) 0x1e00100 else 0x1e00000;
+        const eBlank = tilegen.getTileLibraryEntry(pRoom, 0, nBlank);
+        _ = pushFloor(pRoom, nX, nY, nGridFlags, eBlank);
+    } else {
+        nGridFlags = nFlags;
+        const e = tilegen.getTileLibraryEntry(pRoom, 0, @bitCast(nFlags));
+        _ = pushFloor(pRoom, nX, nY, nGridFlags, e);
+    }
+    if ((nFlags & CELLFLAGS_0x01) != CELLFLAGS_NONE) processWallBlock(pRoom, nX, nY, nFlags, nOtherFlags);
+    if ((nFlags & CELLFLAGS_0x8000000) == CELLFLAGS_NONE) return;
+    processShadowBlock(pRoom, nX, nY, nFlags);
+}
+
+/// Publish the tiles this room created through AddTileData into the level index.
+/// Only these are linked into pRoomTiles->pMapLinks, so only these can ever be
+/// returned by FindTileAtPosition — the tiles ProcessTile creates on its direct
+/// path are invisible to a neighbour's seam lookup.
+fn publishRoomTiles(n: NearRooms, linked: []const LinkedTile, dts: []const dt1.Dt1, final_seed: s.D2SeedStrc) !void {
+    const owner: Rect = .{ .x = n.wx, .y = n.wy, .w = n.w, .h = n.h };
+    n.index.patch_alloc = n.alloc;
+    const owner_idx = n.index.owners.items.len;
+    try n.index.owners.append(n.alloc, .{ .dts = try n.alloc.dupe(dt1.Dt1, dts), .seed = final_seed, .rect = owner });
+    for (linked) |t| try n.index.add(n.alloc, t.wx, t.wy, t.n_tile_type, t.n_flags, owner, t.is_blank, owner_idx);
+}
+
+/// DRLGROOMTILE_UpdateOrAddTile (0x66e940) -> FindTileInNearRooms / AddTileData
+/// (0x66e620). A hit in an already-built near room is updated there (the update
+/// itself only re-types the OWNER's tile, which this room's CollMap reads back
+/// through the shared tile list, so nothing is emitted or rolled here).
+fn updateOrAddTile(pRoom: [*c]s.D2RoomExStrc, nTileType: i32, nX: i32, nY: i32, nFlags: i32) void {
+    if (g_ctx.near) |near| {
+        if (near.find(g_ctx.room_wx + nX, g_ctx.room_wy + nY, nTileType, nFlags, g_ctx.room_rect)) {
+            g_ctx.transition_updated += 1;
+            return;
+        }
+    }
+    // AddTileData: warp types validate the cell is inside the room first.
+    if ((nTileType == 0xb or nTileType == 10) and DrlgRoom.AreXYInsideCoordinates(&pRoom.*.sCoords, nX, nY) == 0) return;
+    const e = tilegen.getTileLibraryEntry(pRoom, nTileType, @bitCast(nFlags));
+    // AddTileData ends in SetupWarpTile for the warp types, and that leaves the room's
+    // NON-FLOOR map-link chain holding only the warp tile — every wall linked before it
+    // stops being reachable from a neighbour's FindTileInNearRooms. Measured in the engine
+    // (d2probe findat): a room with 5 AddTileData walls and two warps among them ends with a
+    // wall chain of exactly 2, while its floor chain keeps all 32.
+    if ((nTileType == 0xb or nTileType == 10) and g_ctx.near != null) {
+        var kept: usize = 0;
+        for (g_ctx.linked.items) |t| {
+            if (t.n_tile_type == 0) {
+                g_ctx.linked.items[kept] = t;
+                kept += 1;
+            }
+        }
+        g_ctx.linked.shrinkRetainingCapacity(kept);
+    }
+    // The DRAW flags the create computes carry the tile's LAYER index
+    // (nFlags |= ((gf>>0x12)&3) * 0x4000 + 0x4000), and FindTileAtPosition 0x66e4c0
+    // filters every candidate on it: a tile with layer bits only answers a visitor
+    // whose own (gf>>0x12)&3 matches. Publishing a placeholder 0 here made every
+    // published tile answer every visitor, so a seam cell whose owner belongs to
+    // another layer was silently taken over instead of being resolved (and rolled)
+    // by the visiting room, the way the engine does.
+    var created: ?*s.D2DrlgTileDataStrc = null;
+    if (nTileType == 0) {
+        created = pushFloor(pRoom, nX, nY, nFlags, e);
+    } else if (nTileType == 0xd) {
+        created = tilegen.createShadowTileData(pRoom, null, nX, nY, @bitCast(nFlags), e);
+    } else {
+        const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoom.*.pRoomTiles);
+        const before: usize = @intCast(pTileGrid.*.nWalls);
+        created = tilegen.createWallTileData(pRoom, null, nX, nY, @bitCast(nFlags), e, nTileType);
+        var c: usize = before + 1;
+        while (c < @as(usize, @intCast(pTileGrid.*.nWalls))) : (c += 1) {
+            if (c < g_ctx.companion.len) g_ctx.companion[c] = true;
+        }
+    }
+    if (g_ctx.near != null) g_ctx.linked.append(g_ctx.link_alloc, .{
+        .wx = g_ctx.room_wx + nX,
+        .wy = g_ctx.room_wy + nY,
+        .n_tile_type = nTileType,
+        .n_flags = if (created) |t| t.nFlags else 0,
+        .is_blank = nTileType == 0 and e != null and e.?.main == 30 and e.?.sub == 0,
+    }) catch {};
+    if ((nTileType == 0xb or nTileType == 10) and pRoom.*.pLevel.?.eD2LevelId != .MatronsDen) {
+        g_ctx.warp_setup_skipped += 1;
+        setupWarpTile(pRoom, nX, nY, nFlags, nTileType);
+    }
+}
+
+/// The RoomTile.cpp floor push (direct array append + fillTileData, not
+/// createFloorTileData — as the engine does inside processTile).
+fn pushFloor(pRoom: [*c]s.D2RoomExStrc, nX: i32, nY: i32, nGridFlags: i32, e: ?*const dt1.Tile) *s.D2DrlgTileDataStrc {
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoom.*.pRoomTiles);
+    const nFloorCount = pTileGrid.*.nFloors;
+    const pFloor: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(pTileGrid.*.pFloorTiles.?));
+    pFloor[@intCast(nFloorCount)].pNext = null;
+    pTileGrid.*.nFloors += 1;
+    tilegen.fillTileData(pRoom, &pFloor[@intCast(nFloorCount)], nX, nY, @bitCast(nGridFlags), e);
+    return &pFloor[@intCast(nFloorCount)];
+}
+
+/// RoomTile.cpp:789 (0066ec10). Walks the grid, driving processTile per cell.
+fn InitRoomTiles(pRoomEx: [*c]s.D2RoomExStrc, pGrid: [*c]s.D2DrlgGridStrc, pOtherGrid: [*c]s.D2DrlgGridStrc, nTileParam: i32, nKillX: i32, nKillY: i32) void {
+    const nWorldPosX = pRoomEx.*.sCoords.WorldPosition.x;
+    const nXMax = @as(i32, @intFromBool(nKillX == 0)) + pRoomEx.*.sCoords.WorldSize.x;
+    const nYOffset = pRoomEx.*.sCoords.WorldPosition.y;
+    var nY: i32 = 0;
+    const maxTile = @as(i32, @intFromBool(nKillY == 0)) + pRoomEx.*.sCoords.WorldSize.y;
+    if (0 >= maxTile) return;
+    while (true) {
+        var nColIdx: i32 = 0;
+        if (0 < nXMax) {
+            while (true) {
+                const nFlags = DrlgGrid.GetGridFlags(pGrid, nColIdx, nY);
+                const nCellFlags: i32 = if (pOtherGrid == null) CELLFLAGS_NONE else DrlgGrid.GetGridFlags(pOtherGrid, nColIdx, nY);
+                processTile(nFlags, pRoomEx, nColIdx + nWorldPosX, nY + nYOffset, nTileParam, nCellFlags);
+                nColIdx += 1;
+                if (!(nColIdx < nXMax)) break;
+            }
+        }
+        nY += 1;
+        if (!(nY < maxTile)) break;
+    }
+}
+
+// ===========================================================================
+// Public consumer API
+// ---------------------------------------------------------------------------
+
+/// DrlgGrid::FlagOperations (0x67c600) as called by DRLGPRESET_InitGridsFromDS1File
+/// (0x6667d0): `FlagOperations(grid, apFlagOperations[0] = OR, 0x84)` walks the grid's
+/// BORDER ring — top row, bottom row, then the first/last column of every other row —
+/// and ORs the flag into each cell. The 0x84 operand's effect on the cell is CELLFLAGS_0x04
+/// (measured against the engine: a border cell 0x42 becomes 0x46, 0x81 becomes 0x85 — the
+/// 0x80 in the operand never reaches the cell), and that 0x04 is what routes every seam
+/// cell through ProcessTile's UpdateOrAddTile branch.
+fn flagBorderCells(g: *const OwnedGrid, flag: i32) void {
+    const wgrid = g.grid;
+    const width: usize = @intCast(wgrid.nWidth);
+    const height: usize = @intCast(wgrid.nHeight);
+    if (width == 0 or height == 0) return;
+    const rows = wgrid.pCellsRowOffsets[0..height];
+    const cells = wgrid.pCellsFlags;
+    for (0..width) |x| {
+        cells[@intCast(rows[0] + @as(i32, @intCast(x)))] |= flag;
+        cells[@intCast(rows[height - 1] + @as(i32, @intCast(x)))] |= flag;
+    }
+    for (1..height) |y| {
+        cells[@intCast(rows[y])] |= flag;
+        cells[@intCast(rows[y] + @as(i32, @intCast(width)) - 1)] |= flag;
+    }
+}
+
+/// DrlgGrid::AlterAllGridFlags as called by DRLGPRESET_InitGridsFromDS1File: OR a flag
+/// into EVERY cell of a grid (as opposed to FlagOperations' border ring). Used to stamp
+/// each layer's index into its own cells as `i << 0x12`, which is what later reappears
+/// in a tile's nFlags as ((layer+1) << 0xe) and is how FindTileAtPosition tells a seam
+/// tile of one layer from another.
+fn flagAllCells(g: *const OwnedGrid, flag: i32) void {
+    const wgrid = g.grid;
+    const height: usize = @intCast(wgrid.nHeight);
+    const width: usize = @intCast(wgrid.nWidth);
+    const rows = wgrid.pCellsRowOffsets[0..height];
+    for (0..height) |y| {
+        for (0..width) |x| wgrid.pCellsFlags[@intCast(rows[y] + @as(i32, @intCast(x)))] |= flag;
+    }
+}
+
+/// A grid cell array + its D2DrlgGridStrc header, owned so we can free it.
+const OwnedGrid = struct {
+    grid: s.D2DrlgGridStrc,
+    cells: []i32,
+    rows: []i32,
+};
+
+fn buildGrid(a: std.mem.Allocator, width: usize, height: usize, cells: []i32) !OwnedGrid {
+    const rows = try a.alloc(i32, height);
+    for (rows, 0..) |*r, y| r.* = @intCast(y * width);
+    return .{
+        .grid = .{
+            .pCellsFlags = cells.ptr,
+            .pCellsRowOffsets = rows.ptr,
+            .nWidth = @intCast(width),
+            .nHeight = @intCast(height),
+            .bIsSubGrid = 1,
+        },
+        .cells = cells,
+        .rows = rows,
+    };
+}
+
+/// A room's WINDOW into the shared level DS1. This is the D2 engine's per-room
+/// CollMap model: the level's whole DS1 is loaded once, but each RoomEx only
+/// materializes its own window (offset+size) of it (InitGridFromTileData points
+/// a sub-grid's pCellsFlags into the parent layer with a row-offset table that
+/// bakes in the room's tile offset). `off_x`/`off_y` are the tile offset of the
+/// room into the DS1 (room.WorldPosition - DS1 origin); `size_x`/`size_y` are
+/// the room's WorldSize (the loops add a +1 kill-edge, so the window spans
+/// size+1 tiles). `seed` is the room's own sSeed (variant selection consumes it).
+pub const Ds1RoomWindow = struct {
+    off_x: i32,
+    off_y: i32,
+    size_x: i32,
+    size_y: i32,
+    seed: s.D2SeedStrc,
+    /// LvlPrest FillBlanks — the engine threads it to FLOOR LAYER 0 ONLY
+    /// (InitializePresetRoom 0x666ac0): an empty inside floor cell gets a Blank.dt1
+    /// floor tile. Layers 1+ and walls/shadow always run with 0.
+    fill_blanks: i32 = 0,
+    /// LvlPrest KillEdge && the room touches the pMap's far X/Y edge: the engine
+    /// drops the +1 kill-edge column/row from every count/init loop.
+    kill_x: i32 = 0,
+    kill_y: i32 = 0,
+    /// The room's level id — the blank fill is level-aware (Arcane Sanctuary 0x4a
+    /// uses Blank sub=1, everything else sub=0; ProcessTile 0x66e9b0).
+    level_id: i32 = 0,
+    /// The REAL generation room's warp node chain (RoomEx+0x4C, built by
+    /// DrlgRoom.allocRoomTile during the act warp-graph pass) — threaded into the
+    /// window-local room shell so ProcessTile's warp branch (InitWarpCacheTiles
+    /// 0x66e360) can find the room's warps.
+    warp_nodes: ?*s.D2DrlgTileGridStrc = null,
+    /// The REAL act's D2DrlgStrc — getWarpsIdIfExists consults pDrlg.pWarpsInfo
+    /// (per-act warp id overrides, e.g. the true-tomb ids) before the LevelDefs
+    /// Warp fallback.
+    real_drlg: ?*s.D2DrlgStrc = null,
+    /// Kill flags for WALL LAYERS >= 1, which follow the raw engine rule
+    /// (InitializePresetRoom 0x666ac0: kill only when LvlPrest KillEdge is set AND
+    /// the room touches the pMap far edge on that axis). The primary kill_x/kill_y
+    /// stay on the stricter interior rule for floors/wall-0/shadow, whose seam
+    /// cells the engine border-marks and routes through the UpdateOrAddTile seam
+    /// machinery (no inline materialization). Wall layers >= 1 are NEVER
+    /// border-marked (InitGridsFromDS1File 0x6667d0 marks wall grid [0], the floor
+    /// grids and the shadow grid only), so their interior-seam cells DO
+    /// materialize inline -- stream-proven on the L117 barricade tower room: the
+    /// engine ledger holds 83 lookups incl. 3 layer-1 seam walls at x==8/y==8
+    /// (types 7/14, the snow shrub walls), scanned 9x9 while its floors stay 8x8.
+    kill1_x: i32 = 0,
+    kill1_y: i32 = 0,
+};
+
+/// A windowed sub-grid header over the whole-DS1 `cells` (row stride `full_w`):
+/// local cell (x,y) maps to DS1 cell (x+off_x, y+off_y).
+fn buildGridWindow(a: std.mem.Allocator, cells: []i32, full_w: usize, off_x: i32, off_y: i32, sub_w: usize, sub_h: usize) !OwnedGrid {
+    const rows = try a.alloc(i32, sub_h);
+    for (rows, 0..) |*r, y| r.* = (@as(i32, @intCast(y)) + off_y) * @as(i32, @intCast(full_w));
+    return .{
+        .grid = .{
+            .pCellsFlags = cells.ptr + @as(usize, @intCast(off_x)),
+            .pCellsRowOffsets = rows.ptr,
+            .nWidth = @intCast(sub_w),
+            .nHeight = @intCast(sub_h),
+            .bIsSubGrid = 1,
+        },
+        .cells = cells,
+        .rows = rows,
+    };
+}
+
+/// One placed tile in room-local TILE coords, carrying its resolved DT1 art and the
+/// draw nFlags — the exact inputs the engine's per-room CollMap builder consumes
+/// (AllocRoomCollisionGrid 0x64c900 → TileLibrary_SetupCollision 0x64c790). The
+/// tile pointer is borrowed (into the level DT1 set or the static fill tiles); it is
+/// valid for the lifetime of the DT1 set that produced it.
+pub const CollTile = struct {
+    nPosX: i32,
+    nPosY: i32,
+    nFlags: i32,
+    tile: *const dt1.Tile,
+    /// True for FLOOR-layer tiles. A room tile-cell with no floor tile is engine "void":
+    /// the runtime CollMap has the Act1\Outdoors\Blank.dt1 fill (solid rock) stamped there
+    /// (that DT1 is absent from our blob, so the caller uses the solid_fill stand-in).
+    is_floor: bool,
+};
+
+pub const MaterializeResult = struct {
+    /// Subtile collision grid rasterized from the materialized FLOOR + WALL tiles
+    /// (roof/shadow array and type-3 companions excluded, matching collision.zig).
+    coll: collision.CollisionGrid,
+    /// tile positions (y*w+x) diverted to the artifact-blocked warp/preset path.
+    special: []bool,
+    /// The room's placed FLOOR + WALL + ROOF tiles in room-local tile coords, for the
+    /// faithful per-room CollMap build (AllocRoomCollisionGrid). Includes the +1
+    /// kill-edge tiles (their world origin lands in the adjacent room, so a neighbour
+    /// picks them up — that is the engine's inter-room border blend).
+    tiles: []CollTile,
+    n_floors: i32,
+    n_walls: i32,
+    n_shadows: i32,
+    special_count: usize,
+    warp_setup_skipped: usize,
+    /// Seam cells whose tile an already-built near room owned (UpdateOrAddTile hit).
+    transition_updated: usize = 0,
+    transition_skipped: usize,
+    unresolved: usize,
+
+    pub fn deinit(self: *MaterializeResult, a: std.mem.Allocator) void {
+        self.coll.deinit();
+        a.free(self.special);
+        a.free(self.tiles);
+    }
+};
+
+/// Collect a room's FLOOR + WALL + ROOF tile-data (post-InitRoomTiles) into a flat
+/// `CollTile` list — the input to the faithful per-room CollMap stamp. Mirrors the
+/// layer order AllocRoomCollisionGrid stamps (floor, wall, roof); OR is order-free so
+/// order is cosmetic. Tiles whose art did not resolve are dropped.
+///
+/// The type-3 wall companion IS included: CreateWallTileData (0x66dc50) writes the
+/// paired type-4 tile into the same pWallTiles array and bumps nWalls, so the engine's
+/// gather stamps it like any other wall. Its DT1 block is not a copy of the type-3's —
+/// e.g. battle.dt1 (3,11,20) is 0x05 while (4,11,20) is 0x07 — so dropping it loses
+/// COLLIDE_BLOCK_MISSILE over the whole wall footprint.
+fn collectCollTiles(a: std.mem.Allocator, pTileGrid: [*c]s.D2DrlgTileGridStrc, max_tx: i32, max_ty: i32, wall_edge: i32) ![]CollTile {
+    var list: std.ArrayListUnmanaged(CollTile) = .empty;
+    errdefer list.deinit(a);
+    const pushArr = struct {
+        fn go(l: *std.ArrayListUnmanaged(CollTile), alloc: std.mem.Allocator, base: ?*anyopaque, n: i32, comp: ?[]const bool, is_floor: bool, mtx: i32, mty: i32) !void {
+            const p: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(base orelse return));
+            var i: usize = 0;
+            while (i < @as(usize, @intCast(n))) : (i += 1) {
+                if (comp) |c| if (i < c.len and c[i]) continue;
+                const td = &p[i];
+                // Drop tiles outside the room's tile rect, EXCEPT the wall array,
+                // whose mtx/mty include the +1 far-edge col/row: a room's +1 WALL
+                // tiles stamp into the abutting neighbor's CollMap via the adjacency
+                // gather (measured against two independent-seed engine goldens).
+                // Floor/shadow +1 tiles are still created (their rarity rolls keep
+                // the room seed stream engine-aligned — dropping them regresses both
+                // goldens) but never contribute collision anywhere: the engine's
+                // steady-state maps carry no floor 0x05 from a neighbor's +1 blank
+                // cells (stamping them over-sets 0x04 by ~1.6k on both seeds).
+                if (td.nPosX < 0 or td.nPosY < 0 or td.nPosX >= mtx or td.nPosY >= mty) continue;
+                const t = tilegen.tileFromEntry(td.pTileLibraryEntry) orelse continue;
+                try l.append(alloc, .{ .nPosX = td.nPosX, .nPosY = td.nPosY, .nFlags = td.nFlags, .tile = t, .is_floor = is_floor });
+            }
+        }
+    }.go;
+    try pushArr(&list, a, pTileGrid.*.pFloorTiles, pTileGrid.*.nFloors, null, true, max_tx + wall_edge, max_ty + wall_edge);
+    try pushArr(&list, a, pTileGrid.*.pWallTiles, pTileGrid.*.nWalls, null, false, max_tx + wall_edge, max_ty + wall_edge);
+    try pushArr(&list, a, pTileGrid.*.pRoofTiles, pTileGrid.*.nShadows, null, false, max_tx, max_ty);
+    return list.toOwnedSlice(a);
+}
+
+/// Faithful port of TileLibrary_AddCollision (0x64c4c0) + AddCollisionFlagToCoords
+/// (0x64c700): stamp one tile into a room CollMap `grid` (row-major, `grid_w` subtiles
+/// wide, `grid_h` tall) at room-relative subtile base (relX, relY). The DT1 25-byte
+/// subtile block is OR'd with the Y (row) axis flipped — grid subtile (dc, dr) reads
+/// block byte (4-dr)*5+dc — and the tile's derived collision flags (drawExtraColl) are
+/// OR'd flat across the whole 5x5 footprint. relX/relY are tile-aligned so the 5x5 fits;
+/// the bounds guards mirror the engine's low-clamp / high-overspill-into-padding.
+pub fn stampCollTile(grid: []u8, grid_w: usize, grid_h: usize, relX: usize, relY: usize, ct: CollTile) void {
+    const extra = drawExtraColl(ct.nFlags);
+    var dr: usize = 0;
+    while (dr < SUBTILES) : (dr += 1) {
+        const gy = relY + dr;
+        if (gy >= grid_h) break;
+        var dc: usize = 0;
+        while (dc < SUBTILES) : (dc += 1) {
+            const gx = relX + dc;
+            if (gx >= grid_w) continue;
+            grid[gy * grid_w + gx] |= ct.tile.subtile(dc, SUBTILES - 1 - dr) | extra;
+        }
+    }
+}
+
+/// Materialize one DS1 (a room's DrlgMap) via the full InitRoomTiles orchestration
+/// and rasterize its floor+wall subtile collision. `dts` is the level's DT1 set
+/// (load order), used as the room's tile library. Caller owns the result.
+pub fn materializeDs1(a: std.mem.Allocator, d: *const ds1.Ds1, dts: []const dt1.Dt1, window: ?Ds1RoomWindow, near: ?NearRooms) !MaterializeResult {
+    const w: usize = @intCast(d.width);
+    const h: usize = @intCast(d.height);
+    const full_ncells = w * h;
+
+    // Default (no window): materialize the WHOLE DS1 as one room — the engine's
+    // per-room CollMap is instead a WINDOW of the shared level DS1 (see caller).
+    const win: Ds1RoomWindow = window orelse .{
+        .off_x = 0,
+        .off_y = 0,
+        .size_x = @intCast(w - 1),
+        .size_y = @intCast(h - 1),
+        .seed = .{ .nSeedLow = 0x1234_5678, .nSeedHigh = 0x29a },
+    };
+    // The count/InitRoomTiles loops add a +1 kill-edge, so the window spans
+    // size+1 tiles; the produced collision grid is (size+1)*5 subtiles.
+    const winW: usize = @intCast(win.size_x + 1);
+    const winH: usize = @intCast(win.size_y + 1);
+    const win_ncells = winW * winH;
+
+    // Arena for all the transient grid/room scaffolding.
+    const ar = roomScratch(&scratch_ds1);
+
+    var tlib = tilegen.TileLib{ .dts = dts };
+    var drlg = std.mem.zeroes(s.D2DrlgStrc);
+    var level = std.mem.zeroes(s.D2DrlgLevelStrc);
+    level.pDrlg = win.real_drlg orelse &drlg;
+    level.eD2LevelId = @enumFromInt(win.level_id);
+
+    var room = std.mem.zeroes(s.D2RoomExStrc);
+    room.pLevel = &level;
+    room.pTileGrid = win.warp_nodes;
+    room.apTiles[0] = @ptrCast(&tlib);
+    room.sSeed = win.seed;
+    // WorldPosition stays 0 so stored nPosX/nPosY are window-local (0..size);
+    // WorldSize is the room's window size. Grid reads are offset via buildGridWindow.
+    room.sCoords = .{
+        .WorldPosition = .{ .x = 0, .y = 0 },
+        .WorldSize = .{ .x = win.size_x, .y = win.size_y },
+    };
+    const pRoom: [*c]s.D2RoomExStrc = &room;
+
+    // ── DS1 → grids (InitGridsFromDS1File). The cell arrays cover the WHOLE DS1;
+    //    the sub-grid headers window each room's (off,size) view into them. ──
+    var floor_grids = try ar.alloc(OwnedGrid, d.floor_layers.len);
+    for (d.floor_layers, 0..) |fl, li| {
+        const cells = try ar.alloc(i32, full_ncells);
+        for (cells, 0..) |*c, i| c.* = @bitCast(fl[i].raw);
+        floor_grids[li] = try buildGridWindow(ar, cells, w, win.off_x, win.off_y, winW, winH);
+    }
+    var wall_grids = try ar.alloc(OwnedGrid, d.wall_layers.len);
+    var orient_grids = try ar.alloc(OwnedGrid, d.wall_layers.len);
+    for (d.wall_layers, 0..) |wl, li| {
+        const wcells = try ar.alloc(i32, full_ncells);
+        const ocells = try ar.alloc(i32, full_ncells);
+        const n = @min(wl.wall.len, wl.orient.len);
+        for (0..full_ncells) |i| {
+            wcells[i] = if (i < n) @bitCast(wl.wall[i].raw) else 0;
+            ocells[i] = if (i < n) wl.orient[i].prop1 else 0; // orient grid == prop1 byte
+        }
+        wall_grids[li] = try buildGridWindow(ar, wcells, w, win.off_x, win.off_y, winW, winH);
+        orient_grids[li] = try buildGridWindow(ar, ocells, w, win.off_x, win.off_y, winW, winH);
+    }
+    const shadow_cells = try ar.alloc(i32, full_ncells);
+    for (shadow_cells, 0..) |*c, i| c.* = @bitCast(d.shadow[i].raw);
+    var shadow_grid = try buildGridWindow(ar, shadow_cells, w, win.off_x, win.off_y, winW, winH);
+
+    // InitGridsFromDS1File, in its order: the wall-grid border ring, then each layer's
+    // index into all of its own cells (wall grids 1.., every floor grid), then the floor
+    // and cell-grid border rings. Orientation grids get neither.
+    if (wall_grids.len != 0) flagBorderCells(&wall_grids[0], CELLFLAGS_0x04);
+    for (wall_grids[@min(1, wall_grids.len)..], 1..) |*g, li| flagAllCells(g, @as(i32, @intCast(li)) << 0x12);
+    for (floor_grids, 0..) |*g, li| flagAllCells(g, @as(i32, @intCast(li)) << 0x12);
+    for (floor_grids) |*g| flagBorderCells(g, CELLFLAGS_0x04);
+    flagBorderCells(&shadow_grid, CELLFLAGS_0x04);
+
+    // ── Room tile grid + count → alloc (InitializePresetRoom order). ──
+    try allocRoomTileGrid(pRoom, ar);
+    for (floor_grids, 0..) |*g, li|
+        countTilesFromGrid(pRoom, &g.grid, if (li == 0) win.fill_blanks else 0, win.kill_x, win.kill_y);
+    for (wall_grids, 0..) |*g, li| {
+        const kx = if (li == 0) win.kill_x else win.kill1_x;
+        const ky = if (li == 0) win.kill_y else win.kill1_y;
+        countWallTilesFromGrid(pRoom, &g.grid, &orient_grids[li].grid, kx, ky);
+        countTilesFromGrid(pRoom, &g.grid, 0, kx, ky);
+    }
+    countTilesFromGrid(pRoom, &shadow_grid.grid, 0, win.kill_x, win.kill_y);
+
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(room.pRoomTiles);
+    // Safety headroom: the count fns are faithful but we route a few special
+    // cells to base tiles; a small pad guarantees no array overflow.
+    pTileGrid.*.nFloorTilesMax += 16;
+    pTileGrid.*.nWallTilesMax += @as(i32, @intCast(win_ncells)) + 16;
+    pTileGrid.*.nRoofTilesMax += @as(i32, @intCast(win_ncells)) + 16;
+    try allocTileDataArrays(pRoom, ar);
+
+    // ── InitRoomTiles per layer. ──
+    var ctx = MatCtx{
+        .width = winW,
+        .special = try a.alloc(bool, win_ncells),
+        .companion = try ar.alloc(bool, @intCast(pTileGrid.*.nWallTilesMax)),
+        .near = if (near) |n| n.index else null,
+        .link_alloc = if (near) |n| n.alloc else a,
+        .room_wx = if (near) |n| n.wx else 0,
+        .room_wy = if (near) |n| n.wy else 0,
+        .room_rect = if (near) |n| .{ .x = n.wx, .y = n.wy, .w = n.w, .h = n.h } else .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    };
+    defer ctx.linked.deinit(if (near) |n| n.alloc else a);
+    @memset(ctx.special, false);
+    @memset(ctx.companion, false);
+    g_ctx = &ctx;
+
+    for (floor_grids, 0..) |*g, li|
+        InitRoomTiles(pRoom, &g.grid, null, if (li == 0) win.fill_blanks else 0, win.kill_x, win.kill_y);
+    for (wall_grids, 0..) |*g, li| InitRoomTiles(
+        pRoom,
+        &g.grid,
+        &orient_grids[li].grid,
+        0,
+        if (li == 0) win.kill_x else win.kill1_x,
+        if (li == 0) win.kill_y else win.kill1_y,
+    );
+    InitRoomTiles(pRoom, &shadow_grid.grid, null, 0, win.kill_x, win.kill_y);
+
+    // ── Rasterize floor + wall tile-data (exclude roof array + companions). ──
+    // The engine's per-room CollMap is dwSizeGameX/Y = WorldSize*5 (NO +1): the +1
+    // kill-edge is only processed to blend the shared room seam, it is not part of
+    // the room's own collision window. So a windowed room outputs size*5 and lets
+    // blitTile clip the seam tiles. The whole-DS1 default (no window) keeps the full
+    // (size+1)*5 = DS1*5 grid the collision.zig cross-check compares against.
+    const outW: usize = if (window != null) @as(usize, @intCast(win.size_x)) * SUBTILES else winW * SUBTILES;
+    const outH: usize = if (window != null) @as(usize, @intCast(win.size_y)) * SUBTILES else winH * SUBTILES;
+    var coll = collision.CollisionGrid{
+        .allocator = a,
+        .width = outW,
+        .height = outH,
+        .cells = try a.alloc(u8, outW * outH),
+        .unresolved = 0,
+    };
+    @memset(coll.cells, 0);
+
+    const pFloor: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(pTileGrid.*.pFloorTiles.?));
+    var fi: usize = 0;
+    while (fi < @as(usize, @intCast(pTileGrid.*.nFloors))) : (fi += 1) {
+        blitTile(&coll, &pFloor[fi]);
+    }
+    if (pTileGrid.*.pWallTiles) |wp| {
+        const pWall: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(wp));
+        var wi: usize = 0;
+        while (wi < @as(usize, @intCast(pTileGrid.*.nWalls))) : (wi += 1) {
+            if (wi < ctx.companion.len and ctx.companion[wi]) continue;
+            blitTile(&coll, &pWall[wi]);
+        }
+    }
+    // The engine's AllocRoomCollisionGrid (0x64c900) stamps the FLOOR, WALL AND ROOF
+    // tile layers into the CollMap. The roof array holds the room's shadow/roof tiles
+    // (createShadowTileData); in caves/dungeons the solid-rock ceiling is a roof tile
+    // that carries wall collision, so omitting it leaves the whole dungeon exterior
+    // void instead of blocked.
+    if (pTileGrid.*.pRoofTiles) |rp| {
+        const pRoof: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(rp));
+        var ri: usize = 0;
+        while (ri < @as(usize, @intCast(pTileGrid.*.nShadows))) : (ri += 1) {
+            blitTile(&coll, &pRoof[ri]);
+        }
+    }
+
+
+    // No-floor subtiles are void/unwalkable: a subtile whose tile has no floor tile
+    // is a dungeon gap (the runtime CollMap has no walkable void, so "no floor =
+    // unwalkable" is faithful). Mark the truly-empty ones with Colbit.blank
+    // (0x20, a synthetic render marker — never an engine collision bit) so the
+    // collision composite renders them as void rather than walkable. Only walls/
+    // real collision keep their own bits; only cells still at 0 get marked. Windowed
+    // (render) path only — the whole-DS1 collision.zig cross-check compares the raw
+    // DT1 rasterization and must not see this marker.
+    if (window != null) {
+        const tW: usize = @intCast(win.size_x);
+        const tH: usize = @intCast(win.size_y);
+        const has_floor = try ar.alloc(bool, tW * tH);
+        @memset(has_floor, false);
+        var ffi: usize = 0;
+        while (ffi < @as(usize, @intCast(pTileGrid.*.nFloors))) : (ffi += 1) {
+            const fx = pFloor[ffi].nPosX;
+            const fy = pFloor[ffi].nPosY;
+            if (fx < 0 or fy < 0) continue;
+            const utx: usize = @intCast(fx);
+            const uty: usize = @intCast(fy);
+            if (utx < tW and uty < tH) has_floor[uty * tW + utx] = true;
+        }
+        var sgy: usize = 0;
+        while (sgy < outH) : (sgy += 1) {
+            const trow = sgy / SUBTILES;
+            var sgx: usize = 0;
+            while (sgx < outW) : (sgx += 1) {
+                const tcol = sgx / SUBTILES;
+                const ci = sgy * outW + sgx;
+                if (tcol < tW and trow < tH and !has_floor[trow * tW + tcol] and coll.cells[ci] == 0) {
+                    coll.cells[ci] = 0x20;
+                }
+            }
+        }
+    }
+
+    // Publish this room's tiles for the rooms built after it (FindTileInNearRooms
+    // skips the searching room, so this must happen only once the room is done).
+    if (near) |n| try publishRoomTiles(n, ctx.linked.items, dts, room.sSeed);
+
+    return .{
+        .coll = coll,
+        .special = ctx.special,
+        .tiles = try collectCollTiles(a, pTileGrid, win.size_x, win.size_y, if (window != null) 1 else 0),
+        .n_floors = pTileGrid.*.nFloors,
+        .n_walls = pTileGrid.*.nWalls,
+        .n_shadows = pTileGrid.*.nShadows,
+        .special_count = ctx.special_count,
+        .warp_setup_skipped = ctx.warp_setup_skipped,
+        .transition_skipped = ctx.transition_skipped,
+        .transition_updated = ctx.transition_updated,
+        .unresolved = 0,
+    };
+}
+
+/// The engine's per-tile draw-flag → collision-flag recompute (Collision.cpp
+/// TileLibrary_SetupCollision): beyond the verbatim DT1 subtile-byte OR, each tile
+/// ORs these bits across its WHOLE 5x5 footprint, from its computed draw nFlags.
+/// This is where wall tiles get COLBIT_WALL (blockwalk) — nGridFlags&0x20000 sets
+/// nFlags 0x40 sets 0x01 — so omitting it drops all maze/dungeon interior walls.
+fn drawExtraColl(nFlags: i32) u8 {
+    var extra: u8 = 0;
+    if (nFlags & 0x02 != 0) extra |= 0x10; // COLBIT_PRESET
+    if (nFlags & 0x40 != 0) extra |= 0x01; // COLBIT_WALL (blocks walk)
+    if (nFlags & 0x80 != 0) extra |= 0x04; // COLBIT_MISSILE_BARRIER
+    return extra;
+}
+
+fn blitTile(coll: *collision.CollisionGrid, td: *const s.D2DrlgTileDataStrc) void {
+    const t = tilegen.tileFromEntry(td.pTileLibraryEntry) orelse return;
+    if (td.nPosX < 0 or td.nPosY < 0) return;
+    const tx: usize = @intCast(td.nPosX);
+    const ty: usize = @intCast(td.nPosY);
+    const extra = drawExtraColl(td.nFlags);
+    // The engine's TileLibrary_AddCollision (0x64c4c0) reads the DT1 25-byte subtile
+    // block with the row (Y) axis FLIPPED: grid cell at tile-relative (dx,dy) takes
+    // byte[(4-dy)*5 + dx]. Mirror that here (the extra draw-flag bits are flat-filled
+    // across the whole footprint, so only the DT1 byte read flips).
+    var sy: usize = 0;
+    while (sy < SUBTILES) : (sy += 1) {
+        const gy = ty * SUBTILES + sy;
+        if (gy >= coll.height) break;
+        var sx: usize = 0;
+        while (sx < SUBTILES) : (sx += 1) {
+            const gx = tx * SUBTILES + sx;
+            if (gx >= coll.width) continue;
+            coll.cells[gy * coll.width + gx] |= t.subtile(sx, SUBTILES - 1 - sy) | extra;
+        }
+    }
+}
+
+// ===========================================================================
+// MILESTONE 2b — WILDERNESS floor-cell materialization.
+//
+// An outdoor level splits its grid into (a) PRESET cells (dwOutdoorFlags&0x200)
+// which get an allocDrlgMap+BuildArea DrlgMap — a DS1, already materializable via
+// materializeDs1 — and (b) FLOOR cells, each a bare 8x8 RoomEx SHELL from
+// DRLGOUTROOM_CreateOutdoorRoomEx (OutPlace.cpp:1577) with NO tile data.
+//
+// The engine gives a floor room its tiles in InitGridCells (Drlg.cpp 0067d2d0):
+//   1. init the room's floor/wall/tile grids at (WorldSize+1);
+//   2. base-fill every 8x8 floor cell with 0x40002 (a plain floor tile,
+//      main=0 sub=0, via OverwriteFlag);
+//   3. Act-I only: DRLGOUTROOM_InitAct1RoomGridCells → the wall/edge overlay;
+//   4. OR the level-type nGridFlag into cells with no terrain bits (0x3f0ff80);
+//   5. mark the grid border (FlagOperations op 0, flag 4) as cross-room
+//      transition cells;
+//   6. then the shared Count / AllocTileDataArrays / InitRoomTiles run (as for
+//      maze rooms in DRLGROOMEX_InitializeMazeRoom) materializes the tiles.
+//
+// materializeOutdoorFloorRoom below is a faithful transform of that whole path,
+// INCLUDING step 3 (see applyAct1WallOverlay + gaWallNeighborOrientTable). The
+// recon was artifact-broken for step 3 (room ptr mistyped D2DrlgLevelStrc*, LUT
+// absent), so the two functions + the 256-entry table were recovered directly
+// from Game.exe (0x680a70 / 0x680b10 / 0x6f2700; real offsets: pRoomEx+0x20 =
+// pRoomExData, +0x28 = floor grid[2], +0x3c = temp edge grid[3]).
+//
+// KEY FINDING: the recovered overlay is a VISUAL floor-edge blend autotiler, NOT
+// a collision source. ComputeWallOrientations OVERWRITEs the FLOOR grid (grid[2])
+// with (orientation 0, main 0, sub = LUT[neighbourMask]) — a grass-edge blend
+// variant. In the Act-I wilderness DT1 set EVERY blocking orientation-0 tile has
+// main==5 (cliffs), and getTileLibraryEntry takes main straight from the grid
+// value (>>0x14), so a main==0 pick is walkable by construction. The overlay
+// therefore changes tile SELECTION (relevant to the M3 byte-exact tile golden)
+// but adds ZERO collision.
+//
+// The blocking terrain of a wilderness level (cliffs / trees / water) lives in
+// the PRESET border cells, which ARE materialized (materializeDs1); the floor
+// rooms are walkable grass by design. Combined, a wilderness collision grid is
+// non-empty and mostly-walkable with blocked preset edges — the faithful shape.
+//
+// GATE SAFETY: pure post-generation consumer, only imported by tests.
+// ---------------------------------------------------------------------------
+
+/// Level-type → floor-cell fill flag OR'd into empty cells (InitGridCells
+/// 0067d2d0, recon lines 5574-5592). Collision-neutral (sets the floor tile's
+/// main index for terrain-variant grass); ported for faithfulness.
+fn outdoorFillFlag(nLevelType: i32, level_id: i32) i32 {
+    return switch (nLevelType) {
+        0x10 => 0x100,
+        0x15 => 0x120000,
+        0x16 => 0x100000,
+        0x1b => 0xa00000,
+        0x1c => 0x1600000,
+        0x1f => if (level_id != 0x75) 0 else 0x600000,
+        else => 0,
+    };
+}
+
+// ===========================================================================
+// OUTDOOR WALL-ORIENTATION OVERLAY (recovered from the 1.14d binary; the recon
+// is artifact-broken for it). This is InitGridCells step 3, ACT_I only:
+//   DRLGOUTROOM_InitAct1RoomGridCells (0x680c80) orchestrates
+//     1. alloc a temp EDGE grid (WorldSize+3, +1 border each side) at
+//        pRoomExData+0x3c;
+//     2. DRLGGRID_SetOutRoomEdgeFlags (0x680a70): for each adjacent-level vertex
+//        list (wilderness data pAdjacentVertices[0..nExitCount]) draw a 2-wide
+//        line (flag 1, OR) along every edge into the edge grid, clipped to the
+//        room's coords expanded by (-1 pos, +3 size);
+//     3. DRLGOUTROOM_ComputeWallOrientations (0x680b10): 8-neighbour autotile —
+//        for each room-local cell whose edge-grid center is set, build an 8-bit
+//        neighbour bitmask and look up a wall orientation in the 256-entry
+//        gaWallNeighborOrientTable (0x6f2700); if nonzero, OVERWRITE the FLOOR
+//        grid cell (pRoomExData+0x28) with (orient<<8)|0x82 — a floor tile of
+//        sub=orient (a cliff/wall-edge variant that carries interior collision).
+//
+// Neighbour->bit map (from DRLGOUTROOM_InitGridNeighborBuffer 0x6809c0 + the
+// mask-build in 0x680b6a; dy<0 == north): bit7 NE, bit6 E, bit5 SE, bit4 N,
+// bit3 S, bit2 NW, bit1 W, bit0 SW.
+// ---------------------------------------------------------------------------
+
+/// gaWallNeighborOrientTable @ 0x6f2700 — 256 entries, keyed on the 8-neighbour
+/// blocked/edge bitmask, value = wall tile orientation (0 = no wall). Baked from
+/// Game.exe .rdata.
+pub const gaWallNeighborOrientTable = [256]u8{
+    0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x10, 0x10, 0x0e, 0x0e, 0x06, 0x13, 0x0e, 0x0e, 0x06, 0x13,
+    0x0f, 0x0f, 0x05, 0x05, 0x0f, 0x0f, 0x15, 0x15, 0x08, 0x08, 0x0a, 0x26, 0x08, 0x08, 0x28, 0x14,
+    0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x10, 0x10, 0x0e, 0x0e, 0x06, 0x13, 0x0e, 0x0e, 0x06, 0x13,
+    0x0f, 0x0f, 0x05, 0x05, 0x0f, 0x0f, 0x15, 0x15, 0x08, 0x08, 0x0a, 0x26, 0x08, 0x08, 0x28, 0x14,
+    0x0d, 0x0d, 0x07, 0x07, 0x0d, 0x0d, 0x0d, 0x07, 0x04, 0x04, 0x0b, 0x25, 0x04, 0x04, 0x0b, 0x2b,
+    0x03, 0x03, 0x0c, 0x0c, 0x03, 0x03, 0x27, 0x27, 0x09, 0x09, 0x02, 0x2b, 0x09, 0x09, 0x2c, 0x1a,
+    0x0d, 0x0d, 0x07, 0x07, 0x0d, 0x0d, 0x0d, 0x07, 0x17, 0x17, 0x29, 0x11, 0x17, 0x17, 0x29, 0x11,
+    0x03, 0x03, 0x0c, 0x0c, 0x03, 0x03, 0x27, 0x27, 0x2a, 0x2a, 0x2e, 0x2a, 0x2a, 0x2a, 0x21, 0x1f,
+    0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x10, 0x10, 0x0e, 0x0e, 0x06, 0x13, 0x0e, 0x0e, 0x06, 0x13,
+    0x0f, 0x0f, 0x05, 0x05, 0x0f, 0x0f, 0x15, 0x15, 0x08, 0x08, 0x0a, 0x26, 0x08, 0x08, 0x23, 0x14,
+    0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x10, 0x10, 0x0e, 0x0e, 0x06, 0x13, 0x0e, 0x0e, 0x06, 0x13,
+    0x0f, 0x0f, 0x05, 0x05, 0x0f, 0x0f, 0x15, 0x15, 0x08, 0x08, 0x0a, 0x26, 0x08, 0x08, 0x28, 0x14,
+    0x0d, 0x0d, 0x07, 0x07, 0x0d, 0x0d, 0x0d, 0x07, 0x04, 0x04, 0x0b, 0x25, 0x04, 0x04, 0x0b, 0x25,
+    0x12, 0x12, 0x23, 0x23, 0x12, 0x12, 0x16, 0x16, 0x24, 0x24, 0x2d, 0x22, 0x24, 0x24, 0x1c, 0x1d,
+    0x0d, 0x0d, 0x07, 0x07, 0x0d, 0x0d, 0x0d, 0x07, 0x17, 0x17, 0x29, 0x11, 0x17, 0x17, 0x29, 0x11,
+    0x12, 0x12, 0x23, 0x23, 0x12, 0x12, 0x16, 0x16, 0x18, 0x18, 0x19, 0x20, 0x18, 0x18, 0x1e, 0x01,
+};
+
+/// Inputs the ACT_I wall/edge overlay needs beyond a bare floor room: the room's
+/// world position (vertex lines are in world coords, clipped per room) and the
+/// wilderness level's adjacent-vertex list heads (pAdjacentVertices[0..nExit]).
+pub const OutdoorOverlay = struct {
+    room_pos: s.POINT,
+    vertices: []const ?*s.D2DrlgVertexStrc,
+};
+
+/// Build the overlay for a live wilderness floor room, or null when it does not
+/// apply (non-ACT_I, no wilderness data, or no exits). ACT_I gate mirrors
+/// InitGridCells (0067d2d0): the overlay runs only for eAct == ACT_I.
+pub fn outdoorOverlayFor(pLevel: *s.D2DrlgLevelStrc, p: *s.D2RoomExStrc) ?OutdoorOverlay {
+    if (Border.GetActNoFromLevelNumber(pLevel.eD2LevelId) != 0) return null; // ACT_I only
+    const wild: *s.D2DrlgLevelDataWildernessLevel = @ptrCast(@alignCast(pLevel.pDrlgLevelData orelse return null));
+    if (wild.nExitCount <= 0) return null;
+    const n: usize = @intCast(@min(@as(i32, 6), wild.nExitCount));
+    return .{ .room_pos = p.sCoords.WorldPosition, .vertices = wild.pAdjacentVertices[0..n] };
+}
+
+/// DRLGOUTROOM_InitAct1RoomGridCells (0x680c80) body: rasterize the adjacent
+/// vertex lines into a temp edge grid, then autotile wall orientations onto the
+/// room-local floor grid `fg`. `ws_x`/`ws_y` are the room's WorldSize.
+fn applyAct1WallOverlay(ar: std.mem.Allocator, fg: *OwnedGrid, ov: OutdoorOverlay, ws_x: i32, ws_y: i32) !void {
+    // Temp edge grid: WorldSize + 3 (a 1-cell border on every side).
+    const egw: usize = @intCast(ws_x + 3);
+    const egh: usize = @intCast(ws_y + 3);
+    const edge_cells = try ar.alloc(i32, egw * egh);
+    @memset(edge_cells, 0);
+    var eg = try buildGrid(ar, egw, egh, edge_cells);
+
+    // SetOutRoomEdgeFlags (0x680a70): room coords expanded (-1 pos, +3 size); the
+    // edge grid's cell (0,0) is world (room_pos-1). For each adjacent vertex list,
+    // OR flag 1 as a 2-wide line along every edge with a successor.
+    var sCoords: s.D2DrlgCoordsStrc = .{
+        .WorldPosition = .{ .x = ov.room_pos.x - 1, .y = ov.room_pos.y - 1 },
+        .WorldSize = .{ .x = ws_x + 3, .y = ws_y + 3 },
+    };
+    for (ov.vertices) |vhead| {
+        var pv = vhead;
+        while (pv) |v| : (pv = v.pNext) {
+            if (v.pNext != null) {
+                DrlgGrid.setLineFlagsWithWidth(&eg.grid, v, &sCoords, 1, 0, 2);
+            }
+        }
+    }
+
+    // ComputeWallOrientations (0x680b10): output cell (ox,oy) maps to edge center
+    // (ox+1,oy+1). Grid is (WorldSize+1) as in InitGridCells.
+    const gw: i32 = ws_x + 1;
+    const gh: i32 = ws_y + 1;
+    var oy: i32 = 0;
+    while (oy < gh) : (oy += 1) {
+        var ox: i32 = 0;
+        while (ox < gw) : (ox += 1) {
+            const ex = ox + 1;
+            const ey = oy + 1;
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex, ey) == 0) continue;
+            var mask: usize = 0;
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex + 1, ey - 1) != 0) mask |= 0x80; // NE
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex + 1, ey) != 0) mask |= 0x40; // E
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex + 1, ey + 1) != 0) mask |= 0x20; // SE
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex, ey - 1) != 0) mask |= 0x10; // N
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex, ey + 1) != 0) mask |= 0x08; // S
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex - 1, ey - 1) != 0) mask |= 0x04; // NW
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex - 1, ey) != 0) mask |= 0x02; // W
+            if (DrlgGrid.GetGridFlags(&eg.grid, ex - 1, ey + 1) != 0) mask |= 0x01; // SW
+            if (mask == 0) continue;
+            const orient = gaWallNeighborOrientTable[mask];
+            if (orient == 0) continue;
+            DrlgGrid.AlterGridFlag(&fg.grid, ox, oy, (@as(i32, orient) << 8) | 0x82, 3);
+        }
+    }
+}
+
+// LvlSub sub-theme terrain placement (InitGridCells step: SubTypeWpShrine, 3rd call).
+//
+// InitGridCells (0067d2d0) calls SubTypeWpShrine three times before Count/Alloc/Init:
+//   1. Waypoint (nSubTypeLookupId = LvlDefs.SubWaypoint, nSubTypeCount = shrineFlags>>16&3)
+//   2. Shrine   (nSubTypeLookupId = LvlDefs.SubShrine,   nSubTypeCount = shrineFlags>>12&0xf)
+//   3. Terrain  (nSubTypeLookupId = nSubType, nSubTypeIndex = nSubTheme, nSubTypeCount = nSubThemePicked)
+//
+// Calls 1 and 2 place waypoint/shrine DS1 tiles, which we skip (they affect wall layers
+// and preset units, not floor collision). Call 3 places sub-theme terrain (Stone, Trees,
+// Puddles, Swamp, etc.) into the floor grid — this IS the source of the 0x10 collision
+// bit gap. The DS1 floor cells carry 0x10000002 (bit 28 = alternate + bit 1 = has floor);
+// ApplyLvlSubTileData writes (flags | 0x80) to the room floor grid; createFloorTileData
+// then sees bit 28 and sets nFlags |= 0x102, which drawExtraColl maps to 0x10 COLBIT_PRESET.
+//
+// Faithful to: SubTypeWpShrine (1.14d @0x6707a0), DoNotCheckAll (0x670170),
+//   DRLGOUTDOOR_CheckSubTileOverlap (0x66fcf0), DRLGOUTDOOR_ApplyLvlSubTileData (floor
+//   grid path only) (0x66fad0).
+
+// DRLGOUTDOOR_CheckSubTileOverlap (0x66fcf0): returns true if the sub-tile DS1 group can be
+// placed at (baseX, baseY) without overlapping existing terrain. Checks the room FLOOR grid
+// (fg) for stamped floor terrain AND the room WALL grid (wg = apWallGrids[0]) for a prior
+// wall-bearing sub-theme placement. A sub group whose DS1 carries wall layers (empty floor)
+// stamps only wg; a floor-only overlap check would wrongly accept a later overlap and drift
+// the seed + every subsequent placement in the room.
+fn checkSubTileOverlap(
+    baseX: i32,
+    baseY: i32,
+    fg: *s.D2DrlgGridStrc,
+    wg: *s.D2DrlgGridStrc,
+    pSubstGroup: *const s.D2DrlgSubstGroupStrc,
+    pSubTxt: *dtables.D2LvlSubTxt,
+) bool {
+    const pw = pSubstGroup.tBox.nWidth;
+    const ph = pSubstGroup.tBox.nHeight;
+    const srcX = pSubstGroup.tBox.nPosX;
+    const srcY = pSubstGroup.tBox.nPosY;
+    const has_wall = pSubTxt.pWallGrid[0].nWidth != 0;
+    var dy: i32 = 0;
+    while (dy < ph) : (dy += 1) {
+        var dx: i32 = 0;
+        while (dx < pw) : (dx += 1) {
+            // Trigger: the sub DS1 cell carries floor terrain (floor bit 2) OR — when the
+            // sub has a wall grid — a wall (wall bit 1). The engine gates the room-overlap
+            // check on BOTH; a floor-only check accepts placements the engine rejects when
+            // a sub carries wall cells (e.g. Object.ds1), drifting seed + position.
+            const sub_floor: u32 = @bitCast(DrlgGrid.GetGridFlags(&pSubTxt.pFloorGrid, srcX + dx, srcY + dy));
+            const triggered = (sub_floor & 2) != 0 or
+                (has_wall and
+                    (@as(u32, @bitCast(DrlgGrid.GetGridFlags(&pSubTxt.pWallGrid[0], srcX + dx, srcY + dy))) & 1) != 0);
+            if (!triggered) continue;
+            // Room cell must have plain floor (bit 1 set) and no terrain bits already stamped.
+            const room_flags: u32 = @bitCast(DrlgGrid.GetGridFlags(fg, baseX + dx, baseY + dy));
+            if (room_flags & 0x3f0ff00 != 0 or room_flags & 2 == 0) return false;
+            // Room wall-layer check (apWallGrids[0]): reject if a PRIOR wall-bearing sub-theme
+            // group already occupies this cell. ApplyLvlSubTileData (0x66fad0) stamps a sub's
+            // wall cells (bit 1) into apWallGrids[0]; CheckSubTileOverlap loops apWallGrids
+            // testing (flags & 1). Without this a new group overlapping a prior wall placement
+            // is wrongly accepted, drifting the seed + every later placement.
+            if (@as(u32, @bitCast(DrlgGrid.GetGridFlags(wg, baseX + dx, baseY + dy))) & 1 != 0) return false;
+        }
+    }
+    return true;
+}
+
+// DRLGOUTDOOR_ApplyLvlSubTileData (0x66fad0) — writes the sub group's floor cells (bit 2) into
+// the room floor grid (fg), and its wall cells (bit 1) into the room wall grid (wg =
+// apWallGrids[0]). The wall stamp is what lets a later group's checkSubTileOverlap reject an
+// overlap with a wall-bearing sub placement.
+//
+// It also spawns a SHADOW tile per sub shadow-grid cell carrying CELLFLAGS_0x8000000, via
+// DRLGROOMTILE_CreateShadowTileFromGrid (0x66e060) = GetTileLibraryEntry(room, 0xd, gf) +
+// CreateShadowTileData. Those tiles are real collision AND each consumes a rarity roll, so
+// omitting them left the room seed short and every later pick in the room on the wrong
+// stream — the engine's outdoor pick streams open with exactly these tt=13 lookups.
+fn applySubTileFloor(
+    pRoom: *s.D2RoomExStrc,
+    fg: *s.D2DrlgGridStrc,
+    wg: *s.D2DrlgGridStrc,
+    og: *s.D2DrlgGridStrc,
+    baseX: i32,
+    baseY: i32,
+    pSubstGroup: *const s.D2DrlgSubstGroupStrc,
+    pSubTxt: *dtables.D2LvlSubTxt,
+) void {
+    const pw = pSubstGroup.tBox.nWidth;
+    const ph = pSubstGroup.tBox.nHeight;
+    const srcX = pSubstGroup.tBox.nPosX;
+    const srcY = pSubstGroup.tBox.nPosY;
+    const has_wall = pSubTxt.pWallGrid[0].nWidth != 0;
+    var dy: i32 = 0;
+    while (dy < ph) : (dy += 1) {
+        var dx: i32 = 0;
+        while (dx < pw) : (dx += 1) {
+            const flags = DrlgGrid.GetGridFlags(&pSubTxt.pFloorGrid, srcX + dx, srcY + dy);
+            if (flags & 2 != 0) {
+                DrlgGrid.AlterGridFlag(fg, baseX + dx, baseY + dy, flags | 0x80, 3);
+            }
+            if (has_wall) {
+                const wall = DrlgGrid.GetGridFlags(&pSubTxt.pWallGrid[0], srcX + dx, srcY + dy);
+                if (wall & 1 != 0) {
+                    DrlgGrid.AlterGridFlag(wg, baseX + dx, baseY + dy, wall, 3);
+                    // The wall grid alone lacks the small-int tile-type used by the wall count
+                    // (orient 3/10/11) and processTile's nOtherFlags: mirror ApplyLvlSubTileData
+                    // by stamping the sub's pTileTypeGrid into the room orient grid at the same cell.
+                    const tt = DrlgGrid.GetGridFlags(&pSubTxt.pTileTypeGrid[0], srcX + dx, srcY + dy);
+                    DrlgGrid.AlterGridFlag(og, baseX + dx, baseY + dy, tt, 3);
+                }
+            }
+            const sh = DrlgGrid.GetGridFlags(&pSubTxt.pShadowGrid, srcX + dx, srcY + dy);
+            if (sh & CELLFLAGS_0x8000000 != 0) {
+                const e = tilegen.getTileLibraryEntry(pRoom, 0xd, @bitCast(sh));
+                _ = tilegen.createShadowTileData(pRoom, null, baseX + dx, baseY + dy, @bitCast(sh), e);
+            }
+        }
+    }
+}
+
+// DoNotCheckAll (1.14d 0x670170): seeded sub-tile placement — picks a random substitution
+// group, then either tries random positions (Trials >= 0) or shuffles all positions
+// exhaustively (Trials == -1), placing the group when overlap-free. Runs Max[nSubTypeIndex]
+// times. Faithful to the C reconstruction (same seed consumption order, same shuffle).
+fn doNotCheckAll(
+    pRoom: *s.D2RoomExStrc,
+    fg: *s.D2DrlgGridStrc,
+    wg: *s.D2DrlgGridStrc,
+    og: *s.D2DrlgGridStrc,
+    pSubTxt: *dtables.D2LvlSubTxt,
+    nSubTypeIndex: i32,
+) void {
+    const pFile = pSubTxt.pDrlgFile orelse return;
+    if (pFile.nSubstGroups == 0) return;
+    const idx: usize = @intCast(@max(0, nSubTypeIndex));
+    if (idx >= 5) return;
+    if (pSubTxt.Max[idx] < 1) return;
+
+    const ws_x = pRoom.sCoords.WorldSize.x;
+    const ws_y = pRoom.sCoords.WorldSize.y;
+
+    var nMaxRemaining: i32 = pSubTxt.Max[idx];
+    while (true) {
+        // Pick a random substitution group from the DS1.
+        const nGroupIdx = drlg_rng.randomNumberSelector(&pRoom.sSeed, @intCast(pFile.nSubstGroups));
+        const pSubstGroups: [*]s.D2DrlgSubstGroupStrc = @ptrCast(@alignCast(pFile.pSubstGroups.?));
+        const pSubstGroup = &pSubstGroups[nGroupIdx];
+
+        const nMaxX: u32 = @bitCast(ws_x - pSubstGroup.tBox.nWidth);
+        const nMaxY: u32 = @bitCast(ws_y - pSubstGroup.tBox.nHeight);
+        // Condition: (int)(nMaxX+1) > 1 && (int)(nMaxY+1) > 1 (i.e. nMaxX >= 1, nMaxY >= 1).
+        if (@as(i32, @bitCast(nMaxX + 1)) > 1 and @as(i32, @bitCast(nMaxY + 1)) > 1) {
+            const nTrialCount = pSubTxt.Trials[idx];
+            if (nTrialCount == -1) {
+                // Exhaustive shuffle: fill all positions, shuffle, try each.
+                const nTotalPositions: u32 = nMaxY * nMaxX;
+                if (nTotalPositions > 0) {
+                    // Array big enough for any 8x8 room minus group (max ~64 entries).
+                    var coordBuf: [514]i32 = undefined;
+                    var nPosX: u32 = 0;
+                    while (nPosX < nTotalPositions) : (nPosX += 1) {
+                        coordBuf[nPosX * 2] = @intCast(nPosX % nMaxX);     // x
+                        coordBuf[nPosX * 2 + 1] = @intCast(nPosX / nMaxX); // y
+                    }
+                    // Shuffle: nTotalPositions random swaps (each uses two randomNumberSelector
+                    // calls). The engine's `do { ... } while (nShuffleRem != 0)` runs exactly
+                    // nTotalPositions iterations (nMaxY starts at nTotalPositions), so `nRem > 0`
+                    // not `> 1` — the final swap consumes seed and matters downstream.
+                    var nRem: u32 = nTotalPositions;
+                    while (nRem > 0) : (nRem -= 1) {
+                        const a_idx = drlg_rng.randomNumberSelector(&pRoom.sSeed, nTotalPositions);
+                        const b_idx = drlg_rng.randomNumberSelector(&pRoom.sSeed, nTotalPositions);
+                        const tx = coordBuf[a_idx * 2];
+                        const ty = coordBuf[a_idx * 2 + 1];
+                        coordBuf[a_idx * 2] = coordBuf[b_idx * 2];
+                        coordBuf[a_idx * 2 + 1] = coordBuf[b_idx * 2 + 1];
+                        coordBuf[b_idx * 2] = tx;
+                        coordBuf[b_idx * 2 + 1] = ty;
+                    }
+                    // Try each shuffled position.
+                    var i: u32 = 0;
+                    while (i < nTotalPositions) : (i += 1) {
+                        const bx: i32 = coordBuf[i * 2] + 1;
+                        const by: i32 = coordBuf[i * 2 + 1] + 1;
+                        if (checkSubTileOverlap(bx, by, fg, wg, pSubstGroup, pSubTxt)) {
+                            applySubTileFloor(pRoom, fg, wg, og, bx, by, pSubstGroup, pSubTxt);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // Random trial: try nTrialCount random positions.
+                var nTrialIter: i32 = 0;
+                while (nTrialIter < nTrialCount) : (nTrialIter += 1) {
+                    const bx: i32 = @intCast(drlg_rng.randomNumberSelector(&pRoom.sSeed, nMaxX) + 1);
+                    const by: i32 = @intCast(drlg_rng.randomNumberSelector(&pRoom.sSeed, nMaxY) + 1);
+                    if (checkSubTileOverlap(bx, by, fg, wg, pSubstGroup, pSubTxt)) {
+                        applySubTileFloor(pRoom, fg, wg, og, bx, by, pSubstGroup, pSubTxt);
+                        break;
+                    }
+                }
+            }
+        }
+
+        nMaxRemaining -= 1;
+        if (nMaxRemaining == 0) return;
+    }
+}
+
+// SubTypeWpShrine (1.14d 0x6707a0) — sub-theme terrain pass: iterate the bit-mask of which
+// consecutive LvlSub rows (by Type) to apply, load each DS1 file, and call DoNotCheckAll
+// (or CheckAll, but all outdoor terrain subs have CheckAll=0). Writes the floor grid (fg) and
+// the wall grid (wg) + its orient grid (og); the shadow part of ApplyLvlSubTileData is skipped.
+fn applySubThemeTerrain(
+    pRoom: *s.D2RoomExStrc,
+    fg: *s.D2DrlgGridStrc,
+    wg: *s.D2DrlgGridStrc,
+    og: *s.D2DrlgGridStrc,
+    nSubTypeLookupId: i32,
+    nSubTypeIndex: i32,
+    nSubTypeCount: i32,
+) void {
+    if (nSubTypeLookupId == -1) return;
+    var dwBitMask: u32 = @bitCast(nSubTypeCount);
+    var pLine = dtables.lvlSubGetLineFromSubType(nSubTypeLookupId);
+    if (pLine == null) return;
+    while (dwBitMask != 0) : ({
+        dwBitMask >>= 1;
+        pLine += 1;
+    }) {
+        if (dwBitMask & 1 == 0) continue;
+        const pRec: *dtables.D2LvlSubTxt = @ptrCast(pLine);
+        TileSub.InitializeDrlgFile(null, pRec);
+        const pFile = pRec.pDrlgFile orelse continue;
+        if (pFile.nSubstGroups == 0) continue;
+        if (pRec.CheckAll == 0) {
+            doNotCheckAll(pRoom, fg, wg, og, pRec, nSubTypeIndex);
+        }
+        // CheckAll (nAct 1 or 2 path) not needed for outdoor terrain subs (all CheckAll=0).
+    }
+}
+
+/// Materialize one outdoor FLOOR room (an 8x8 CreateOutdoorRoomEx shell) into a
+/// room-local floor collision grid. Faithful transform of InitGridCells
+/// (0067d2d0), including the ACT_I wall-orientation overlay (step 3) when
+/// `overlay` is supplied (see applyAct1WallOverlay). Then the shared
+/// Count/Alloc/InitRoomTiles orchestration + rasterize. `dts` is the level's DT1
+/// library (LvlTypes File1..32 for the level's LevelType). WorldPosition is 0 so
+/// stored nPosX/nPosY are room-local (0..WorldSize-1).
+pub fn materializeOutdoorFloorRoom(
+    a: std.mem.Allocator,
+    dts: []const dt1.Dt1,
+    ws_x: i32,
+    ws_y: i32,
+    nLevelType: i32,
+    level_id: i32,
+    room_seed: i32,
+    overlay: ?OutdoorOverlay,
+    nSubType: i32,
+    nSubTheme: i32,
+    nSubThemePicked: i32,
+    nWaypointCount: i32,
+    nShrineCount: i32,
+    near: ?NearRooms,
+) !MaterializeResult {
+    const ar = roomScratch(&scratch_outdoor_room);
+
+    // Grid is (WorldSize+1) per InitGridCells; the floor footprint is 8x8.
+    const gw: usize = @intCast(ws_x + 1);
+    const gh: usize = @intCast(ws_y + 1);
+    const ncells = gw * gh;
+
+    var tlib = tilegen.TileLib{ .dts = dts };
+    var drlg = std.mem.zeroes(s.D2DrlgStrc);
+    var level = std.mem.zeroes(s.D2DrlgLevelStrc);
+    level.pDrlg = &drlg;
+    level.eD2LevelId = @enumFromInt(level_id);
+
+    var room = std.mem.zeroes(s.D2RoomExStrc);
+    room.pLevel = &level;
+    room.apTiles[0] = @ptrCast(&tlib);
+    // InitGridCells: sSeed.nSeedLow = nSeed, nSeedHigh = 0x29a.
+    room.sSeed = .{ .nSeedLow = room_seed, .nSeedHigh = 0x29a };
+    room.sCoords = .{
+        .WorldPosition = .{ .x = 0, .y = 0 },
+        .WorldSize = .{ .x = ws_x, .y = ws_y },
+    };
+    const pRoom: [*c]s.D2RoomExStrc = &room;
+
+    // ── Build the outdoor floor grid (InitGridCells body). ──
+    const floor_cells = try ar.alloc(i32, ncells);
+    @memset(floor_cells, 0);
+    var fg = try buildGrid(ar, gw, gh, floor_cells);
+
+    // Room wall grid (apWallGrids[0]): sub-theme groups whose DS1 carries wall layers stamp
+    // their wall cells here so a later group's checkSubTileOverlap rejects the overlap (as the
+    // engine does). InitGridCells hardcodes nWallLayerCount=1 and allocates this grid.
+    const wall_cells = try ar.alloc(i32, ncells);
+    @memset(wall_cells, 0);
+    var wg = try buildGrid(ar, gw, gh, wall_cells);
+
+    // Room orient grid for the sub-theme wall cells (the tile-type/orientation the wall
+    // count + InitRoomTiles read as pOrientGrid, stamped from each sub's pTileTypeGrid).
+    const orient_cells = try ar.alloc(i32, ncells);
+    @memset(orient_cells, 0);
+    var og = try buildGrid(ar, gw, gh, orient_cells);
+
+    // Base fill: 8x8 floor cells = 0x40002 (OverwriteFlag / op 3).
+    {
+        var yy: i32 = 0;
+        while (yy < 8 and yy < ws_y) : (yy += 1) {
+            var xx: i32 = 0;
+            while (xx < 8 and xx < ws_x) : (xx += 1) {
+                DrlgGrid.AlterGridFlag(&fg.grid, xx, yy, 0x40002, 3);
+            }
+        }
+    }
+    // ACT_I step 3: the wall/edge orientation overlay (interior cliffs). Runs
+    // AFTER the 8x8 base-fill and BEFORE the level-type OR-fill (InitGridCells
+    // order): the overwritten oriented cells carry sub bits, so the OR-fill's
+    // `(cell & 0x3f0ff80)==0` guard then skips them.
+    if (overlay) |ov| try applyAct1WallOverlay(ar, &fg, ov, ws_x, ws_y);
+
+    // Sub-theme passes (SubTypeWpShrine, 3 calls in InitGridCells) run after
+    // AllocRoomTileGrid, in this exact order: waypoint, shrine, terrain. The waypoint
+    // and shrine calls place their own LvlSub DS1s AND consume the room seed via
+    // DoNotCheckAll; skipping them drifts the room seed so the terrain pass then picks
+    // different substitution groups/positions (the dominant outdoor 0x10 error). The
+    // waypoint/shrine sub-type ids come from the level's LvlDefs line; counts from the
+    // room's eRoomExFlags (>>0x10&3 waypoint, >>0xc&0xf shrine).
+    try allocRoomTileGrid(pRoom, ar);
+    {
+        // ApplyLvlSubTileData calls DRLGROOMTILE_GrowTileDataArray for the shadow tiles it
+        // is about to spawn, so the roof array has to exist BEFORE the sub passes run (the
+        // normal count/alloc pass comes later). Allocate it here with room for one shadow
+        // per cell; allocTileDataArrays leaves a non-null pRoofTiles alone.
+        const pg: [*c]s.D2DrlgTileGridStrc = @ptrCast(pRoom.*.pRoomTiles);
+        const n = ncells + 16;
+        const arr = try ar.alloc(s.D2DrlgTileDataStrc, n);
+        @memset(std.mem.sliceAsBytes(arr), 0);
+        pg.*.pRoofTiles = @ptrCast(arr.ptr);
+        pg.*.nRoofTilesMax = @intCast(n);
+    }
+    const pDef = dtables.levelDefsGetLine(@enumFromInt(level_id));
+    if (nWaypointCount != 0) applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, pDef.*.SubWaypoint, 0, nWaypointCount);
+    if (nShrineCount != 0) applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, pDef.*.SubShrine, 0, nShrineCount);
+    applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, nSubType, nSubTheme, nSubThemePicked);
+
+    // OR the level-type fill flag into cells with no terrain bits (OrFlag / op 0).
+    const nGridFlag = outdoorFillFlag(nLevelType, level_id);
+    if (nGridFlag != 0) {
+        var yy: i32 = 0;
+        while (yy < @as(i32, @intCast(gh))) : (yy += 1) {
+            var xx: i32 = 0;
+            while (xx < @as(i32, @intCast(gw))) : (xx += 1) {
+                if ((DrlgGrid.GetGridFlags(&fg.grid, xx, yy) & 0x3f0ff80) == 0) {
+                    DrlgGrid.AlterGridFlag(&fg.grid, xx, yy, nGridFlag, 0);
+                }
+            }
+        }
+    }
+    // InitGridCells' closing pair: FlagOperations(wall,0,4) then FlagOperations(floor,0,4)
+    // ORs CELLFLAGS_0x04 into each grid's BORDER ring, exactly as the preset path's
+    // 0x84 call does. This used to be omitted as "collision-neutral" — that was true only
+    // while the port had no UpdateOrAddTile: 0x04 routes a seam cell to the near-room
+    // lookup, so it decides whether this room emits the shared edge (and burns a rarity
+    // roll) or defers to the neighbour that already owns it.
+
+    flagBorderCells(&wg, CELLFLAGS_0x04);
+    flagBorderCells(&fg, CELLFLAGS_0x04);
+
+    // ── Count → alloc → InitRoomTiles (as DRLGROOMEX_InitializeMazeRoom). ──
+    countTilesFromGrid(pRoom, &fg.grid, 0, 0, 0);
+    // Sub-theme groups stamp wall cells into the room wall grid; InitGridCells materializes
+    // that grid alongside the floor grid (Count/Alloc/InitRoomTiles over apWallGrids[0]), so
+    // count its walls too (mirrors materializeDs1's wall-grid pass).
+    countWallTilesFromGrid(pRoom, &wg.grid, &og.grid, 0, 0);
+    countTilesFromGrid(pRoom, &wg.grid, 0, 0, 0);
+
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(room.pRoomTiles);
+    pTileGrid.*.nFloorTilesMax += 16; // headroom (a few cells route to base tiles)
+    pTileGrid.*.nWallTilesMax += @as(i32, @intCast(ncells)) + 16;
+    pTileGrid.*.nRoofTilesMax += @as(i32, @intCast(ncells)) + 16;
+    try allocTileDataArrays(pRoom, ar);
+
+    var ctx = MatCtx{
+        .width = gw,
+        .special = try a.alloc(bool, ncells),
+        .companion = try ar.alloc(bool, @intCast(pTileGrid.*.nWallTilesMax)),
+        .near = if (near) |n| n.index else null,
+        .link_alloc = if (near) |n| n.alloc else a,
+        .room_wx = if (near) |n| n.wx else 0,
+        .room_wy = if (near) |n| n.wy else 0,
+        .room_rect = if (near) |n| .{ .x = n.wx, .y = n.wy, .w = n.w, .h = n.h } else .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    };
+    @memset(ctx.special, false);
+    @memset(ctx.companion, false);
+    defer ctx.linked.deinit(if (near) |n| n.alloc else a);
+    g_ctx = &ctx;
+
+    InitRoomTiles(pRoom, &fg.grid, null, 0, 0, 0);
+    // Materialize the sub-theme wall grid (orient grid as pOtherGrid), as InitGridCells does.
+    InitRoomTiles(pRoom, &wg.grid, &og.grid, 0, 0, 0);
+
+    // ── Rasterize floor + wall collision (room-local, 8x8 tile footprint). ──
+    const cw: usize = @intCast(ws_x);
+    const ch: usize = @intCast(ws_y);
+    var coll = collision.CollisionGrid{
+        .allocator = a,
+        .width = cw * SUBTILES,
+        .height = ch * SUBTILES,
+        .cells = try a.alloc(u8, cw * ch * SUBTILES * SUBTILES),
+        .unresolved = 0,
+    };
+    @memset(coll.cells, 0);
+
+    const pFloor: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(pTileGrid.*.pFloorTiles.?));
+    var fi: usize = 0;
+    while (fi < @as(usize, @intCast(pTileGrid.*.nFloors))) : (fi += 1) {
+        blitTile(&coll, &pFloor[fi]);
+    }
+    if (pTileGrid.*.pWallTiles) |wp| {
+        const pWall: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(wp));
+        var wi: usize = 0;
+        while (wi < @as(usize, @intCast(pTileGrid.*.nWalls))) : (wi += 1) {
+            if (wi < ctx.companion.len and ctx.companion[wi]) continue;
+            blitTile(&coll, &pWall[wi]);
+        }
+    }
+
+    if (near) |n| try publishRoomTiles(n, ctx.linked.items, dts, room.sSeed);
+
+    return .{
+        .coll = coll,
+        .special = ctx.special,
+        .tiles = try collectCollTiles(a, pTileGrid, ws_x, ws_y, 1),
+        .n_floors = pTileGrid.*.nFloors,
+        .n_walls = pTileGrid.*.nWalls,
+        .n_shadows = pTileGrid.*.nShadows,
+        .special_count = ctx.special_count,
+        .warp_setup_skipped = ctx.warp_setup_skipped,
+        .transition_skipped = ctx.transition_skipped,
+        .transition_updated = ctx.transition_updated,
+        .unresolved = 0,
+    };
+}
+
+/// A single tile the materialization placed for a room, in room-local tile coords,
+/// carrying the DT1 identity (orientation/main/sub) so a pixel renderer can look up
+/// the art in the same DT1 set. `pass`: 0=floor, 1=wall. Roofs proper (orient 15)
+/// don't occur in wilderness floor rooms; shadows (orient 13) are excluded.
+pub const PlacedTile = struct {
+    pos_x: i32,
+    pos_y: i32,
+    orient: i32,
+    main: i32,
+    sub: i32,
+    pass: u8,
+};
+
+/// Materialize a wilderness FLOOR room and return its placed FLOOR + WALL tiles
+/// (identities + room-local positions) so a pixel renderer can draw grass/cliff
+/// tiles for outdoor rooms that carry NO preset DS1. Same InitGridCells +
+/// InitRoomTiles orchestration as materializeOutdoorFloorRoom (which returns only
+/// collision) — this variant walks the produced pRoomTiles tile-data arrays
+/// instead of rasterizing collision. Caller owns the returned slice.
+pub fn outdoorFloorRoomTiles(
+    a: std.mem.Allocator,
+    dts: []const dt1.Dt1,
+    ws_x: i32,
+    ws_y: i32,
+    nLevelType: i32,
+    level_id: i32,
+    room_seed: i32,
+    overlay: ?OutdoorOverlay,
+) ![]PlacedTile {
+    const ar = roomScratch(&scratch_outdoor_tiles);
+
+    const gw: usize = @intCast(ws_x + 1);
+    const gh: usize = @intCast(ws_y + 1);
+    const ncells = gw * gh;
+
+    var tlib = tilegen.TileLib{ .dts = dts };
+    var drlg = std.mem.zeroes(s.D2DrlgStrc);
+    var level = std.mem.zeroes(s.D2DrlgLevelStrc);
+    level.pDrlg = &drlg;
+    level.eD2LevelId = @enumFromInt(level_id);
+
+    var room = std.mem.zeroes(s.D2RoomExStrc);
+    room.pLevel = &level;
+    room.apTiles[0] = @ptrCast(&tlib);
+    room.sSeed = .{ .nSeedLow = room_seed, .nSeedHigh = 0x29a };
+    room.sCoords = .{
+        .WorldPosition = .{ .x = 0, .y = 0 },
+        .WorldSize = .{ .x = ws_x, .y = ws_y },
+    };
+    const pRoom: [*c]s.D2RoomExStrc = &room;
+
+    // ── Build the outdoor floor grid (InitGridCells body). ──
+    const floor_cells = try ar.alloc(i32, ncells);
+    @memset(floor_cells, 0);
+    var fg = try buildGrid(ar, gw, gh, floor_cells);
+
+    {
+        var yy: i32 = 0;
+        while (yy < 8 and yy < ws_y) : (yy += 1) {
+            var xx: i32 = 0;
+            while (xx < 8 and xx < ws_x) : (xx += 1) {
+                DrlgGrid.AlterGridFlag(&fg.grid, xx, yy, 0x40002, 3);
+            }
+        }
+    }
+    if (overlay) |ov| try applyAct1WallOverlay(ar, &fg, ov, ws_x, ws_y);
+
+    const nGridFlag = outdoorFillFlag(nLevelType, level_id);
+    if (nGridFlag != 0) {
+        var yy: i32 = 0;
+        while (yy < @as(i32, @intCast(gh))) : (yy += 1) {
+            var xx: i32 = 0;
+            while (xx < @as(i32, @intCast(gw))) : (xx += 1) {
+                if ((DrlgGrid.GetGridFlags(&fg.grid, xx, yy) & 0x3f0ff80) == 0) {
+                    DrlgGrid.AlterGridFlag(&fg.grid, xx, yy, nGridFlag, 0);
+                }
+            }
+        }
+    }
+
+    // ── Count → alloc → InitRoomTiles (as DRLGROOMEX_InitializeMazeRoom). ──
+    try allocRoomTileGrid(pRoom, ar);
+    countTilesFromGrid(pRoom, &fg.grid, 0, 0, 0);
+
+    const pTileGrid: [*c]s.D2DrlgTileGridStrc = @ptrCast(room.pRoomTiles);
+    pTileGrid.*.nFloorTilesMax += 16;
+    pTileGrid.*.nWallTilesMax += @as(i32, @intCast(ncells)) + 16;
+    pTileGrid.*.nRoofTilesMax += @as(i32, @intCast(ncells)) + 16;
+    try allocTileDataArrays(pRoom, ar);
+
+    var ctx = MatCtx{
+        .width = gw,
+        .special = try ar.alloc(bool, ncells),
+        .companion = try ar.alloc(bool, @intCast(pTileGrid.*.nWallTilesMax)),
+    };
+    @memset(ctx.special, false);
+    @memset(ctx.companion, false);
+    g_ctx = &ctx;
+
+    InitRoomTiles(pRoom, &fg.grid, null, 0, 0, 0);
+
+    // ── Walk the produced tile-data arrays, emitting identities for rendering. ──
+    var out: std.ArrayListUnmanaged(PlacedTile) = .empty;
+    errdefer out.deinit(a);
+
+    if (pTileGrid.*.pFloorTiles) |fp| {
+        const pFloor: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(fp));
+        var fi: usize = 0;
+        while (fi < @as(usize, @intCast(pTileGrid.*.nFloors))) : (fi += 1) {
+            const td = &pFloor[fi];
+            if (td.nPosX < 0 or td.nPosY < 0) continue;
+            const t = tilegen.tileFromEntry(td.pTileLibraryEntry) orelse continue;
+            try out.append(a, .{ .pos_x = td.nPosX, .pos_y = td.nPosY, .orient = t.orientation, .main = t.main, .sub = t.sub, .pass = 0 });
+        }
+    }
+    if (pTileGrid.*.pWallTiles) |wp| {
+        const pWall: [*]s.D2DrlgTileDataStrc = @ptrCast(@alignCast(wp));
+        var wi: usize = 0;
+        while (wi < @as(usize, @intCast(pTileGrid.*.nWalls))) : (wi += 1) {
+            if (wi < ctx.companion.len and ctx.companion[wi]) continue;
+            const td = &pWall[wi];
+            if (td.nPosX < 0 or td.nPosY < 0) continue;
+            const t = tilegen.tileFromEntry(td.pTileLibraryEntry) orelse continue;
+            try out.append(a, .{ .pos_x = td.nPosX, .pos_y = td.nPosY, .orient = t.orientation, .main = t.main, .sub = t.sub, .pass = 1 });
+        }
+    }
+
+    return out.toOwnedSlice(a);
+}
+
+// ===========================================================================
+// CROSS-CHECK (M2a acceptance #3): the full InitRoomTiles orchestration must
+// reproduce collision.zig's DS1-based collision for several levels.
+// ---------------------------------------------------------------------------
+const testing = std.testing;
+
+/// The fidelity numbers below, printed only when asked for — see testdiag.zig.
+const vprint = @import("../testdiag.zig").print;
+
+/// Compare a materialized grid to a collision.zig baseline over the SAME DS1 +
+/// DT1 set, masking the special (artifact-blocked warp/preset) tile positions.
+/// Returns {resolved subtiles, matches}.
+/// The collision bit `collision.zig` (a walkability rasterizer) does not model: 0x10
+/// ALTERNATE_FLOOR. The engine (and our materialize path, verified against the pColl
+/// golden) OR-sets it on sub-theme floor subtiles, but it NEVER blocks walk or LOS — so
+/// it's outside a collision/walkability cross-check and is masked here.
+const COLL_XCHECK_MASK: u8 = ~@as(u8, 0x10);
+
+/// Compare the materialize collision grid against the `collision.zig` reference on every
+/// resolved, non-special subtile. `umask` (per DS1 tile) skips tiles `collision.zig` cannot
+/// resolve from the caller's DT1 set — the reference produces nothing there, so a comparison
+/// would be against a hole, not a value. The 0x10 alternate-floor bit is masked (see above).
+fn compareMasked(base: *const collision.CollisionGrid, mine: *const MaterializeResult, w: usize, umask: ?[]const bool) struct { total: usize, match: usize } {
+    var total: usize = 0;
+    var matched: usize = 0;
+    var y: usize = 0;
+    while (y < base.height) : (y += 1) {
+        var x: usize = 0;
+        while (x < base.width) : (x += 1) {
+            const tk = (y / SUBTILES) * w + (x / SUBTILES);
+            if (tk < mine.special.len and mine.special[tk]) continue; // materialize special
+            if (umask) |um| if (tk < um.len and um[tk]) continue; // unresolved in the reference
+            total += 1;
+            const bv = base.cells[y * base.width + x] & COLL_XCHECK_MASK;
+            const mv = mine.coll.cells[y * mine.coll.width + x] & COLL_XCHECK_MASK;
+            if (bv == mv) matched += 1;
+        }
+    }
+    return .{ .total = total, .match = matched };
+}
+
+test "materialize: InitRoomTiles reproduces collision.zig DS1 collision (town)" {
+    const a = testing.allocator;
+    const dt1_files = [_][]const u8{
+        @embedFile("../maps/Act1_Town_Floor.dt1"),
+        @embedFile("../maps/Act1_Town_trees.dt1"),
+        @embedFile("../maps/Act1_Town_Fence.dt1"),
+        @embedFile("../maps/Act1_Town_Objects.dt1"),
+        @embedFile("../maps/Act1_Outdoors_stonewall.dt1"),
+    };
+    var dts: [dt1_files.len]dt1.Dt1 = undefined;
+    for (dt1_files, 0..) |bytes, i| dts[i] = try dt1.parse(a, bytes);
+    defer for (&dts) |*d| d.deinit();
+
+    var dtlib = collision.DtLibrary.init(a);
+    defer dtlib.deinit();
+    for (&dts) |*d| try dtlib.add(d);
+
+    var d = try ds1.parse(a, @embedFile("../maps/Act1_Town_TownN1.ds1"));
+    defer d.deinit();
+
+    var base = try collision.rasterize(a, &d, &dtlib);
+    defer base.deinit();
+
+    var mine = try materializeDs1(a, &d, &dts, null, null);
+    defer mine.deinit(a);
+
+    try testing.expectEqual(base.width, mine.coll.width);
+    try testing.expectEqual(base.height, mine.coll.height);
+
+    // Mask the tiles collision.zig couldn't resolve from this DT1 set (the town DS1
+    // references tiles the 5 embedded fixtures don't fully cover — base leaves them 0),
+    // exactly as the multi-level cross-check below does.
+    const ncells: usize = @intCast(d.width * d.height);
+    const umask = try a.alloc(bool, ncells);
+    defer a.free(umask);
+    @memset(umask, false);
+    const nun = unresolvedMask(&d, &dtlib, umask);
+
+    const r = compareMasked(&base, &mine, @intCast(d.width), umask);
+    const pct: f64 = if (r.total == 0) 100.0 else @as(f64, @floatFromInt(r.match)) * 100.0 / @as(f64, @floatFromInt(r.total));
+    vprint(
+        "\n[materialize] town {d}x{d}: floors={d} walls={d} shadows={d} special={d} " ++
+            "warp_skip={d} unresolved={d} | resolved subtile match {d}/{d} ({d:.3}%)\n",
+        .{ d.width, d.height, mine.n_floors, mine.n_walls, mine.n_shadows, mine.special_count, mine.warp_setup_skipped, nun, r.match, r.total, pct },
+    );
+    // Materialize reproduces collision.zig on the resolved, non-special, non-ambiguous
+    // subtiles (masking the never-blocking 0x10 alternate-floor bit). The small residual is
+    // collision.zig's first-variant simplification — materialize is engine-exact per the
+    // authoritative pColl golden (coll_allacts_verify). Regression guard only.
+    try testing.expect(pct >= 99.0);
+}
+
+/// Tile positions the cross-check cannot fairly compare against collision.zig: those it
+/// can't resolve (missing DT1), AND those whose rarity variants disagree on collision
+/// (collision.zig keeps the first variant; the engine/materialize pick a seed-weighted one,
+/// so the reference is arbitrary there — not a bug). Both are masked, exactly as
+/// collision.rasterize already skips the unresolved ones.
+fn unresolvedMask(d: *const ds1.Ds1, dtlib: *const collision.DtLibrary, mask: []bool) usize {
+    var n: usize = 0;
+    for (d.floor_layers) |fl| {
+        for (fl, 0..) |c, i| {
+            if (c.raw & 0x00ff_ffff == 0) continue;
+            const main = @as(i32, @intCast((c.raw >> 20) & 0x3f));
+            const sub = @as(i32, @intCast((c.raw >> 8) & 0xff));
+            if (dtlib.find(0, main, sub) == null or dtlib.isAmbiguous(0, main, sub)) {
+                if (i < mask.len and !mask[i]) { mask[i] = true; n += 1; }
+            }
+        }
+    }
+    for (d.wall_layers) |wl| {
+        const cnt = @min(wl.wall.len, wl.orient.len);
+        var i: usize = 0;
+        while (i < cnt) : (i += 1) {
+            const wc = wl.wall[i];
+            if (wc.raw & 0x00ff_ffff == 0) continue;
+            const main = @as(i32, @intCast((wc.raw >> 20) & 0x3f));
+            const sub = @as(i32, @intCast((wc.raw >> 8) & 0xff));
+            const orient = wl.orient[i].prop1;
+            if (dtlib.find(orient, main, sub) == null or dtlib.isAmbiguous(orient, main, sub)) {
+                if (i < mask.len and !mask[i]) { mask[i] = true; n += 1; }
+            }
+        }
+    }
+    return n;
+}
+
+test "materialize: InitRoomTiles reproduces collision.zig for several maze/preset levels" {
+    const a = testing.allocator;
+    var ctx = lib.Ctx.init(a) catch return; // skip cleanly if data tables absent
+    defer ctx.deinit();
+    // lib.generate() rewires the thread-local DRLG pool allocator + level tables
+    // to this run's (throwaway) pool; restore them so later tests that use the
+    // default pool allocator don't touch freed memory.
+    const saved_alloc = dpool.allocator;
+    const saved_tables = dtables.g_lvl_tables;
+    defer {
+        dpool.allocator = saved_alloc;
+        dtables.g_lvl_tables = saved_tables;
+    }
+
+    const raw = dt1blob.decompress(a, dt1_data.bytes) catch return;
+    defer a.free(raw);
+    var idx = dt1blob.buildIndex(a, raw) catch return;
+    defer idx.deinit();
+
+    const seed: u32 = 0x0396_4b8d;
+    // Crypt (maze), Catacombs (preset+maze mix, has unresolved DT1s), Cathedral
+    // (preset), Tristram (preset).
+    const levels = [_]struct { id: i32, name: []const u8 }{
+        .{ .id = 18, .name = "Crypt" },
+        .{ .id = 33, .name = "Cathedral" },
+        .{ .id = 35, .name = "CatacombsLvl2" },
+        .{ .id = 38, .name = "Tristram" },
+    };
+
+    vprint("\n", .{});
+    for (levels) |L| {
+        const tlv = ctx.act.level(L.id) orelse continue;
+        var w: i32 = 64;
+        var h: i32 = 64;
+        if (tlv.size_x > 0 and tlv.size_y > 0) {
+            w = @intCast(tlv.size_x);
+            h = @intCast(tlv.size_y);
+        }
+        const lvl = lib.generate(&ctx, seed, @enumFromInt(L.id), .normal, .{ .x = 0, .y = 0, .w = w, .h = h }) catch |e| {
+            vprint("[materialize] {s}: generate failed ({any})\n", .{ L.name, e });
+            continue;
+        };
+        defer lvl.deinit();
+
+        var files: [32][]const u8 = undefined;
+        const nf = ctx.act.typeFiles(tlv.lvl_type, &files);
+        var dtlib = collision.DtLibrary.init(a);
+        defer dtlib.deinit();
+        var dts: std.ArrayListUnmanaged(dt1.Dt1) = .empty;
+        defer {
+            for (dts.items) |*dd| dd.deinit();
+            dts.deinit(a);
+        }
+        for (files[0..nf]) |f| {
+            const rec = idx.get(f) orelse continue;
+            const dd = dt1blob.unpack(a, rec) catch continue;
+            dts.append(a, dd) catch continue;
+        }
+        for (dts.items) |*dd| dtlib.add(dd) catch {};
+
+        var maps: usize = 0;
+        var total: usize = 0;
+        var matched: usize = 0;
+        var special_total: usize = 0;
+        var unresolved_total: usize = 0;
+
+        var seen: std.ArrayListUnmanaged(usize) = .empty;
+        defer seen.deinit(a);
+
+        var pr = lvl.firstRoom();
+        while (pr) |p| : (pr = p.pRoomExNext) {
+            const data = p.pRoomExData orelse continue;
+            const rd: *s.D2DrlgPresetRoomStrc = @ptrCast(@alignCast(data));
+            const pmap = rd.pMap orelse continue;
+            if (pmap.pTxtLevelPrest == null or pmap.nSizeX <= 0 or pmap.nSizeY <= 0) continue;
+            const key = @intFromPtr(pmap);
+            var dup = false;
+            for (seen.items) |sk| if (sk == key) { dup = true; break; };
+            if (dup) continue;
+            seen.append(a, key) catch {};
+
+            const rel = preset.presetDs1Path(pmap) orelse continue;
+            var d = preset.unpackDs1(a, rel) orelse continue;
+            defer d.deinit();
+
+            var base = collision.rasterize(a, &d, &dtlib) catch continue;
+            defer base.deinit();
+            var mine = materializeDs1(a, &d, dts.items, null, null) catch continue;
+            defer mine.deinit(a);
+            if (base.width != mine.coll.width or base.height != mine.coll.height) continue;
+
+            const ncells: usize = @intCast(d.width * d.height);
+            const umask = a.alloc(bool, ncells) catch continue;
+            defer a.free(umask);
+            @memset(umask, false);
+            const nun = unresolvedMask(&d, &dtlib, umask);
+            unresolved_total += nun;
+            special_total += mine.special_count;
+
+            const r = compareMasked(&base, &mine, @intCast(d.width), umask);
+            total += r.total;
+            matched += r.match;
+            maps += 1;
+        }
+
+        if (maps == 0) {
+            vprint("[materialize] {s}: no preset DrlgMaps (pure maze/wilderness)\n", .{L.name});
+            continue;
+        }
+        const pct: f64 = if (total == 0) 100.0 else @as(f64, @floatFromInt(matched)) * 100.0 / @as(f64, @floatFromInt(total));
+        vprint(
+            "[materialize] {s}: {d} map(s) | resolved subtile match {d}/{d} ({d:.3}%) | unresolved tiles {d} | special {d}\n",
+            .{ L.name, maps, matched, total, pct, unresolved_total, special_total },
+        );
+        // The orchestration reproduces collision on RESOLVED, non-special subtiles.
+        // Residual <1% diffs are rarity-VARIANT collision-block selection: the
+        // engine's faithful seed-weighted getTileLibraryEntry pick vs
+        // collision.zig's first-variant-wins DtLibrary. (The town, single-variant,
+        // is byte-exact above.) Unresolved (missing-DT1) tiles are masked+reported.
+        // SECONDARY cross-check. The AUTHORITATIVE materialize fidelity gate is
+        // coll_allacts_verify (materialize vs the real engine pColl golden, 99.98%). This
+        // compares against collision.zig — a SIMPLIFIED first-variant rasterizer that itself
+        // diverges from the engine by ~1-3% on orchestration-sensitive tiles — so after
+        // masking unresolved + variant-ambiguous + the never-blocking 0x10 bit, a small
+        // residual remains (it's collision.zig's simplification, not a materialize bug:
+        // materialize is engine-exact per the golden). Guard against gross regressions only.
+        try testing.expect(pct >= 96.0);
+    }
+}
+
+/// OR a room-local collision grid into a level-wide grid at subtile offset.
+fn blitInto(dst: *collision.CollisionGrid, src: *const collision.CollisionGrid, ox: usize, oy: usize) void {
+    var y: usize = 0;
+    while (y < src.height) : (y += 1) {
+        const gy = oy + y;
+        if (gy >= dst.height) break;
+        var x: usize = 0;
+        while (x < src.width) : (x += 1) {
+            const gx = ox + x;
+            if (gx >= dst.width) continue;
+            dst.cells[gy * dst.width + gx] |= src.cells[y * src.width + x];
+        }
+    }
+}
+
+/// Materialize + structurally check one live wilderness level (preset borders
+/// via DS1 + floor cells via materializeOutdoorFloorRoom) into one collision
+/// grid. Runs inside the act's pool (rooms still live). Returns false to skip.
+fn checkWildernessLevel(a: std.mem.Allocator, ctx: *lib.Ctx, idx: *const dt1blob.Index, pLevel: *s.D2DrlgLevelStrc, level_id: i32, name: []const u8) !void {
+    const tlv = ctx.act.level(level_id) orelse return;
+    const nLevelType: i32 = @intFromEnum(pLevel.nLevelType);
+    const lvlPos = pLevel.sCoordinatesAndSize.WorldPosition;
+    const lw = pLevel.sCoordinatesAndSize.WorldSize.x;
+    const lh = pLevel.sCoordinatesAndSize.WorldSize.y;
+    if (lw <= 0 or lh <= 0) return;
+
+    // Level's DT1 library (LvlTypes File1..32 for this LevelType).
+    var files: [32][]const u8 = undefined;
+    const nf = ctx.act.typeFiles(tlv.lvl_type, &files);
+    var dtlib = collision.DtLibrary.init(a);
+    defer dtlib.deinit();
+    var dts: std.ArrayListUnmanaged(dt1.Dt1) = .empty;
+    defer {
+        for (dts.items) |*dd| dd.deinit();
+        dts.deinit(a);
+    }
+    for (files[0..nf]) |f| {
+        const rec = idx.get(f) orelse continue;
+        const dd = dt1blob.unpack(a, rec) catch continue;
+        dts.append(a, dd) catch continue;
+    }
+    for (dts.items) |*dd| dtlib.add(dd) catch {};
+
+    // Two level-wide collision grids (subtiles): baseline (floor+border only) vs
+    // overlay (with the recovered ACT_I wall/edge orientation overlay).
+    const nsub = @as(usize, @intCast(lw * lh)) * SUBTILES * SUBTILES;
+    var level_base = collision.CollisionGrid{
+        .allocator = a,
+        .width = @as(usize, @intCast(lw)) * SUBTILES,
+        .height = @as(usize, @intCast(lh)) * SUBTILES,
+        .cells = try a.alloc(u8, nsub),
+        .unresolved = 0,
+    };
+    defer level_base.deinit();
+    @memset(level_base.cells, 0);
+    var level_over = collision.CollisionGrid{
+        .allocator = a,
+        .width = @as(usize, @intCast(lw)) * SUBTILES,
+        .height = @as(usize, @intCast(lh)) * SUBTILES,
+        .cells = try a.alloc(u8, nsub),
+        .unresolved = 0,
+    };
+    defer level_over.deinit();
+    @memset(level_over.cells, 0);
+
+    var floor_rooms: usize = 0;
+    var preset_rooms: usize = 0;
+    var floor_tiles: usize = 0;
+    var unresolved_total: usize = 0;
+
+    var pr: ?*s.D2RoomExStrc = pLevel.pRoomExFirst;
+    while (pr) |p| : (pr = p.pRoomExNext) {
+        const ox: usize = @intCast(@max(0, p.sCoords.WorldPosition.x - lvlPos.x) * SUBTILES);
+        const oy: usize = @intCast(@max(0, p.sCoords.WorldPosition.y - lvlPos.y) * SUBTILES);
+
+        if (p.nPresetType == 2) {
+            // PRESET border cell — materialize its DrlgMap DS1 (blocking terrain).
+            const data = p.pRoomExData orelse continue;
+            const rd: *s.D2DrlgPresetRoomStrc = @ptrCast(@alignCast(data));
+            const pmap = rd.pMap orelse continue;
+            if (pmap.pTxtLevelPrest == null or pmap.nSizeX <= 0 or pmap.nSizeY <= 0) continue;
+            const rel = preset.presetDs1Path(pmap) orelse continue;
+            var d = preset.unpackDs1(a, rel) orelse continue;
+            defer d.deinit();
+            var rc = collision.rasterize(a, &d, &dtlib) catch continue;
+            defer rc.deinit();
+            unresolved_total += rc.unresolved;
+            blitInto(&level_base, &rc, ox, oy);
+            blitInto(&level_over, &rc, ox, oy);
+            preset_rooms += 1;
+        } else if (p.eRoomExFlags.noLos) {
+            // FLOOR cell — the M2b path. Baseline (no overlay) + overlay pass.
+            var rb = materializeOutdoorFloorRoom(a, dts.items, p.sCoords.WorldSize.x, p.sCoords.WorldSize.y, nLevelType, level_id, p.nSeed, null, -1, 0, 0, @intCast(@as(u8, p.eRoomExFlags.waypoint)), @intCast(@as(u8, p.eRoomExFlags.shrineRows)), null) catch continue;
+            defer rb.deinit(a);
+            blitInto(&level_base, &rb.coll, ox, oy);
+            var rc = materializeOutdoorFloorRoom(a, dts.items, p.sCoords.WorldSize.x, p.sCoords.WorldSize.y, nLevelType, level_id, p.nSeed, outdoorOverlayFor(pLevel, p), -1, 0, 0, @intCast(@as(u8, p.eRoomExFlags.waypoint)), @intCast(@as(u8, p.eRoomExFlags.shrineRows)), null) catch continue;
+            defer rc.deinit(a);
+            floor_tiles += @intCast(rc.n_floors);
+            blitInto(&level_over, &rc.coll, ox, oy);
+            floor_rooms += 1;
+        }
+    }
+
+    var blocked_base: usize = 0;
+    for (level_base.cells) |cflag| {
+        if (cflag & dt1.SubtileFlag.block_walk != 0) blocked_base += 1;
+    }
+    var blocked_over: usize = 0;
+    for (level_over.cells) |cflag| {
+        if (cflag & dt1.SubtileFlag.block_walk != 0) blocked_over += 1;
+    }
+    const total_sub = level_over.cells.len;
+    const pct_base: f64 = @as(f64, @floatFromInt(blocked_base)) * 100.0 / @as(f64, @floatFromInt(total_sub));
+    const pct_over: f64 = @as(f64, @floatFromInt(blocked_over)) * 100.0 / @as(f64, @floatFromInt(total_sub));
+    vprint(
+        "[materialize] {s} {d}x{d} type={d}: floor_rooms={d} ({d} floor tiles) preset_rooms={d} | blocked baseline {d:.2}% -> overlay {d:.2}% | unresolved(preset) {d}\n",
+        .{ name, lw, lh, nLevelType, floor_rooms, floor_tiles, preset_rooms, pct_base, pct_over, unresolved_total },
+    );
+
+    // Structural: floor cells materialized real tiles → no longer all-void.
+    try testing.expect(floor_rooms > 0);
+    try testing.expect(floor_tiles > 0);
+    // The recovered ACT_I wall/edge overlay (SetOutRoomEdgeFlags +
+    // ComputeWallOrientations, 0x680a70/0x680b10) is faithfully ported but is a
+    // VISUAL floor-edge blend autotiler: it OVERWRITEs floor cells with
+    // (orientation 0, main 0, sub=LUT) tiles. In the Act-I wilderness DT1 set
+    // EVERY orientation-0 blocking tile has main==5 (cliffs), so a main==0 pick
+    // never blocks — the overlay is collision-NEUTRAL by construction. Blocking
+    // wilderness terrain is the preset border cells (already materialized), not
+    // the floor rooms. So overlay collision must equal the baseline; it must not
+    // regress.
+    try testing.expect(blocked_over == blocked_base);
+    // Plausible: mostly walkable (blocking is only preset edges, not all-blocked).
+    try testing.expect(pct_over < 60.0);
+}
+
+test "materialize: wilderness floor cells + preset borders → non-empty plausible collision (M2b)" {
+    const a = testing.allocator;
+    var ctx = lib.Ctx.init(a) catch return; // skip cleanly if data tables absent
+    defer ctx.deinit();
+    const saved_alloc = dpool.allocator;
+    const saved_tables = dtables.g_lvl_tables;
+    defer {
+        dpool.allocator = saved_alloc;
+        dtables.g_lvl_tables = saved_tables;
+    }
+
+    const raw = dt1blob.decompress(a, dt1_data.bytes) catch return;
+    defer a.free(raw);
+    var idx = dt1blob.buildIndex(a, raw) catch return;
+    defer idx.deinit();
+
+    const seed: u32 = 0x0396_4b8d;
+    const act_no: i32 = 0; // Act I
+
+    // Wilderness levels REQUIRE the full act placement (neighbor orths drive the
+    // border vertex ring); a standalone lib.generate crashes in DRLGVER. So we
+    // replicate generateAct's live-generation setup and materialize BEFORE the
+    // pool teardown (mirrors lib.generateAct exactly, minus the RoomRect copy-out).
+    var pool = fog.PoolManager.init(a);
+    defer pool.deinit();
+    dtables.g_lvl_tables = &ctx.lvl;
+    dpool.allocator = pool.allocator();
+    dpool.resetRegistry();
+
+    var act = act_mod.build(a, &ctx.act, act_no, seed) catch return;
+    defer act.deinit(a);
+
+    var pDrlg: s.D2DrlgStrc = undefined;
+    _ = drlgmod.allocDrlgActMisc(&pDrlg, 1, seed, .None, 0, @intFromEnum(lib.Difficulty.normal));
+
+    // Act-I level ids.
+    var ids: std.ArrayListUnmanaged(i32) = .empty;
+    defer ids.deinit(a);
+    var row: usize = 0;
+    while (row < ctx.act.levelCount()) : (row += 1) {
+        if (ctx.act.levelAtRow(row)) |lv| {
+            if (lv.act == act_no) ids.append(a, @intCast(lv.id)) catch {};
+        }
+    }
+
+    // Pass 1: real world coords before orths.
+    for (ids.items) |lid| {
+        const pLevel = drlgmod.GetLevelAndAlloc(&pDrlg, @enumFromInt(lid));
+        const c = act.coords(&ctx.act, lid);
+        pLevel.sCoordinatesAndSize = .{
+            .WorldPosition = .{ .x = c.x, .y = c.y },
+            .WorldSize = .{ .x = c.w, .y = c.h },
+        };
+    }
+    // Act-I ParseLevelData pass-2 preset picks: town orientation + Courtyard
+    // jail-exit variant, both from placement direction.
+    drlgmod.applyAct1PresetPicks(&pDrlg, &ctx.act, seed);
+    drlgmod.buildInterLevelOrths(&pDrlg);
+
+    const targets = [_]struct { id: i32, name: []const u8 }{
+        .{ .id = 2, .name = "BloodMoor" },
+        .{ .id = 3, .name = "ColdPlains" },
+        .{ .id = 4, .name = "StonyField" },
+    };
+
+    vprint("\n", .{});
+    // Pass 2: generate every level (as generateAct); materialize the targets live.
+    for (ids.items) |lid| {
+        const pLevel = drlgmod.GetLevelAndAlloc(&pDrlg, @enumFromInt(lid));
+        drlgmod.InitLevel(pLevel);
+        for (targets) |t| {
+            if (t.id == lid) try checkWildernessLevel(a, &ctx, &idx, pLevel, lid, t.name);
+        }
+    }
+}

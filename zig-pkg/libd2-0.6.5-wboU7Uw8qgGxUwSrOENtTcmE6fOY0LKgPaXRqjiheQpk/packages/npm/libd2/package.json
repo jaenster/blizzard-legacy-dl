@@ -1,0 +1,38 @@
+{
+  "name": "libd2",
+  "version": "0.6.5",
+  "description": "Clean-room Diablo II 1.14d engine core as WebAssembly. Give it a seed and it produces the same world the game does: rooms, objects, monsters, level adjacency and subtile collision. Runs in Node, Bun, Deno and the browser.",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "diablo2",
+    "drlg",
+    "map",
+    "procgen",
+    "seed"
+  ],
+  "license": "MIT",
+  "repository": "github:jaenster/libd2",
+  "homepage": "https://github.com/jaenster/libd2",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}

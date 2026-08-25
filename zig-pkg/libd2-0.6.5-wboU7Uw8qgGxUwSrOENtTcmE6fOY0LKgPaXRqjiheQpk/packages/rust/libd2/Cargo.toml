@@ -1,0 +1,40 @@
+[package]
+name = "libd2"
+version = "0.1.0-rc.1"
+edition = "2021"
+rust-version = "1.70"
+description = "Clean-room Diablo II 1.14d engine core. Give it a seed and it produces the same world the game does: rooms, objects, monsters, level adjacency and subtile collision, for every level of all five acts. No game installation required."
+license = "MIT"
+repository = "https://github.com/jaenster/libd2"
+homepage = "https://github.com/jaenster/libd2"
+readme = "README.md"
+keywords = ["diablo2", "drlg", "map", "procgen", "seed"]
+categories = ["game-development", "api-bindings"]
+# Explicit, because the vendored engine/ is gitignored: without a list cargo falls back to
+# git for the file set and silently drops it, producing a crate that cannot build. Packaging
+# must not depend on whether the working tree happens to be dirty.
+include = [
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "examples/**/*.rs",
+    "engine/**",
+]
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[example]]
+name = "world"
