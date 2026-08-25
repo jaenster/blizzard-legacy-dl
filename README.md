@@ -7,12 +7,19 @@ servers, without running their downloader.
 docker run --rm -v "$PWD:/data" ghcr.io/jaenster/blizzard-legacy-dl fetch D2XP -o /data
 ```
 
-Or a static binary from the releases page, or build it:
+## Install
 
-```
-zig build
-zig-out/bin/blizzard-legacy-dl fetch D2XP -o ./out
-```
+Grab a binary from the [releases](../../releases) page — Windows, macOS and Linux, x86-64 and
+arm64, no runtime to install:
+
+| | |
+|-|-|
+|Windows|`blizzard-legacy-dl-x86_64-windows.exe`|
+|macOS|`blizzard-legacy-dl-aarch64-macos` (Apple silicon), `-x86_64-macos` (Intel)|
+|Linux|`blizzard-legacy-dl-x86_64-linux-musl`, `-aarch64-linux-musl` (static)|
+|Docker|`ghcr.io/jaenster/blizzard-legacy-dl`|
+
+Building from source is in [BUILD.md](BUILD.md).
 
 ## Usage
 
@@ -78,15 +85,3 @@ four servers. A `server list` entry serves only the piece range it names. The tr
 answers, can supply more. `--base` accepts the same syntax.
 
 Pieces are fetched in a random order rather than sequentially. `--sequential` turns that off.
-
-## Library
-
-```zig
-const legacy = @import("legacy");
-const meta = try legacy.fromStub(gpa, stub_bytes);
-const url  = try meta.pieceUrl(gpa, 0, null);
-try meta.verify(0, piece_bytes);
-```
-
-`zig build test` covers the bencode decoder, URL expansion, short final pieces, the tracker
-announce, and a full fetch/verify/reassemble against a payload built and served on the spot.
