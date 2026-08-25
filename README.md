@@ -14,22 +14,54 @@ arm64, no runtime to install:
 
 | | |
 |-|-|
-|Windows|`blizzard-legacy-dl-x86_64-windows.exe`|
-|macOS|`blizzard-legacy-dl-aarch64-macos` (Apple silicon), `-x86_64-macos` (Intel)|
-|Linux|`blizzard-legacy-dl-x86_64-linux-musl`, `-aarch64-linux-musl` (static)|
+|Windows|`-x86_64-windows.exe`, `-aarch64-windows.exe`|
+|macOS|`-aarch64-macos` (Apple silicon), `-x86_64-macos` (Intel)|
+|Linux|`-x86_64-linux-musl`, `-aarch64-linux-musl` (static)|
 |Docker|`ghcr.io/jaenster/blizzard-legacy-dl`|
+
+Or install it in one line:
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/jaenster/blizzard-legacy-dl/main/install.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/jaenster/blizzard-legacy-dl/main/install.ps1 | iex
+```
+
+Both pick the right build for your machine and check it against the release's `SHA256SUMS`.
+There is a Homebrew formula in `Formula/` for a tap.
 
 Building from source is in [BUILD.md](BUILD.md).
 
 ## Usage
 
-Give it a product code and it fetches everything itself:
+A product code is all it needs — it fetches the stub, its access token and the payload itself:
 
+```sh
+blizzard-legacy-dl fetch D2DV -o ./out            # Diablo II            1.5 GB
+blizzard-legacy-dl fetch D2XP -o ./out            # Lord of Destruction  509 MB
+blizzard-legacy-dl fetch STAR -o ./out            # StarCraft + Brood War
+blizzard-legacy-dl fetch WAR3 -o ./out            # Reign of Chaos
+blizzard-legacy-dl fetch W3XP -o ./out            # The Frozen Throne
+
+blizzard-legacy-dl fetch D2XP --locale de-DE      # another language
+blizzard-legacy-dl fetch STAR --os MAC            # the Mac build
+
+blizzard-legacy-dl info D2DV                      # look before downloading
+blizzard-legacy-dl fetch D2DV --to 20             # just the first 21 pieces
+blizzard-legacy-dl verify D2DV -o ./out           # re-check what you have
 ```
-blizzard-legacy-dl info  D2DV
-blizzard-legacy-dl fetch D2XP -o ./out
-blizzard-legacy-dl fetch STAR --locale de-DE
+
+Docker takes the same arguments:
+
+```sh
+docker run --rm -v "$PWD:/data" ghcr.io/jaenster/blizzard-legacy-dl fetch D2XP -o /data
 ```
+
+Interrupted downloads resume: run the same command again and it fetches only what is missing.
 
 Products are `D2DV` (Diablo II), `D2XP` (Lord of Destruction), `STAR` (StarCraft),
 `WAR3` (Reign of Chaos) and `W3XP` (The Frozen Throne). `--locale` defaults to `en-US`;
