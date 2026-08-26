@@ -8,3 +8,10 @@ out/
 download/
 stubs/
 build/
+
+# payloads and assembled game directories, none of which belong in the repo
+*-Installer-??-??/
+*-Installer-enUS/
+d2dv-*/
+d2xp-*/
+*-game/
