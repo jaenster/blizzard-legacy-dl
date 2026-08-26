@@ -770,13 +770,25 @@ fn patchTo(
             if (w.data) |d| try members.append(gpa, .{ .name = w.name, .data = d }) else short += 1;
         }
         if (members.items.len != 0) {
+            // Give it a `(listfile)`, which Blizzard's own patch_d2.mpq does not have. An archive
+            // stores hashes rather than names, so one without a listfile cannot be enumerated at
+            // all — and a tool that reduces an archive by walking its names silently produces an
+            // EMPTY one instead of failing. We know every name here; writing them down costs a few
+            // kilobytes and removes that whole class of quiet damage.
+            var listing: std.Io.Writer.Allocating = .init(gpa);
+            for (members.items) |m| {
+                try listing.writer.writeAll(m.name);
+                try listing.writer.writeAll("\r\n");
+            }
+            try members.append(gpa, .{ .name = "(listfile)", .data = listing.written() });
+
             var slots: u32 = 16;
             while (slots < members.items.len * 2) slots *= 2;
             const empty = try mpq.empty(gpa, slots);
             const built = try mpq.append(gpa, empty, members.items);
             const full = try std.fmt.allocPrint(gpa, "{s}/patch_d2.mpq", .{game});
             try writeWhole(io, full, built);
-            rebuilt = members.items.len;
+            rebuilt = members.items.len - 1; // the listfile is ours, not one of the patch's members
         }
     } else |_| {}
 
