@@ -93,6 +93,7 @@ plan    <stub> [n]                 the URL for piece n and the files it spans
 fetch   <stub> [-o dir]            fetch, verify and assemble
 verify  <stub> [-o dir]            re-check an assembled payload against its piece hashes
 run     <stub> [-o dir]            the full downloader sequence, printed step by step
+install <stub> [--game dir]        fetch, then build a playable game directory
 stubs   -o <dir>                   download every product/locale/os stub there is
 proxy   [--port n]                 log HTTP requests passing through, and forward them
 ```
@@ -107,6 +108,44 @@ it an open relay for anything else on that network for as long as it runs.
 Files are preallocated at full length, then each piece is written where it lands, so a fetch
 resumes and does not care about order. `verify` is useful on its own against a copy you got
 some other way.
+
+## Installing the game
+
+`install` goes a step further than `fetch`: it reads the payload's own install script and builds a
+playable game directory from it, without running Blizzard's installer or Windows.
+
+```sh
+blizzard-legacy-dl install D2XP --game ./d2            # current version, 1.14b
+blizzard-legacy-dl install D2XP 1.13c --game ./d2      # or any older one
+blizzard-legacy-dl install D2DV 1.09b --game ./classic # classic on its own
+```
+
+An expansion install builds the base game first and installs over it, because that is what the
+expansion's script expects to find. `--no-base` skips that when the base game is already there.
+
+Older versions are reached by patching what the payload carries, and the two lineages have
+different starting points: a classic patch applies to the 1.00 files, an expansion patch to the
+1.07 ones. Both come out of the archives the payload installs, so no second download is needed
+beyond the patch itself. `patch_d2.mpq` is rebuilt from scratch rather than patched, since most of
+its members are deltas against files spread across the other archives.
+
+Payloads are cached and shared between versions — installing four versions downloads once. The
+cache lives under `$BLIZZARD_LEGACY_DL_CACHE`, else `$XDG_CACHE_HOME` or `~/.cache`.
+
+### CD keys
+
+Diablo II does not keep the CD key in the registry. It keeps it encrypted inside one of the game's
+own archives, under the name of an ordinary asset — a cursor sound for the classic key, an Amazon
+animation for the expansion one. The installer puts it there; `install` can do the same:
+
+```sh
+blizzard-legacy-dl install D2XP --game ./d2 \
+  --cdkey <16-or-26-char-key> --cdkey-expansion <26-char-key> --owner <name>
+```
+
+Classic and expansion are different keys and go to different archives. Which archive is not
+guessed — it comes from the install script, so a payload that names another one is followed as it
+stands. Leave the options off and no key is stored, exactly as before.
 
 ## The access token
 
