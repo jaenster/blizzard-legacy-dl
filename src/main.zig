@@ -32,6 +32,9 @@ const usage =
     \\  --sequential   fetch pieces in order; the client shuffles them, and so do we
     \\  --cookie <v>   override the CDN access token taken from the stub
     \\  --game <dir>   where install puts the game (default: alongside, named "<payload>-game")
+    \\                 install keeps its payloads in a cache shared by every version:
+    \\                 $BLIZZARD_LEGACY_DL_CACHE, else $XDG_CACHE_HOME or ~/.cache, under
+    \\                 blizzard-legacy-dl/. -o overrides it; fetch and run still use the cwd.
     \\  --no-base      install an expansion on its own, without its base game first
     \\  --version <v>  install an older version, e.g. 1.09b (or give it as the 3rd argument)
     \\  --patch-source where patch archives come from
@@ -96,6 +99,21 @@ fn zpath(gpa: std.mem.Allocator, parts: []const []const u8) ![:0]u8 {
         try b.appendSlice(gpa, p);
     }
     return b.toOwnedSliceSentinel(gpa, 0);
+}
+
+/// Where payloads live when nobody says otherwise. A payload for a given product and locale never
+/// changes, so every install of every version can share one copy.
+fn cacheDir(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ![]const u8 {
+    const base = env.get("BLIZZARD_LEGACY_DL_CACHE") orelse
+        env.get("XDG_CACHE_HOME") orelse
+        env.get("LOCALAPPDATA") orelse
+        if (env.get("HOME")) |home|
+            try std.fmt.allocPrint(gpa, "{s}/.cache", .{home})
+        else
+            return ".";
+    const dir = try std.fmt.allocPrint(gpa, "{s}/blizzard-legacy-dl", .{base});
+    mkdirs(io, dir) catch return ".";
+    return dir;
 }
 
 /// Create every directory on the way to `path`, ignoring the ones already there.
@@ -444,7 +462,11 @@ pub fn main(init: std.process.Init) !void {
 
     // The payload gets its own directory named after the torrent, so the cwd is a fine default
     // and saves typing -o . every time.
-    const dir_path = out_dir orelse ".";
+    //
+    // Not for `install`, though: there the payload is scratch on the way to a game directory, and
+    // running the command from somewhere else should not mean fetching the same immutable gigabyte
+    // and a half again. Those go to a cache, which every install shares.
+    const dir_path = out_dir orelse if (std.mem.eql(u8, verb, "install")) try cacheDir(gpa, init.io, init.environ_map) else ".";
 
     // An expansion installs over its base game, so asking to install one means installing both,
     // base first. Only `install` does this: fetching an expansion on its own is a fine thing to
@@ -455,14 +477,13 @@ pub fn main(init: std.process.Init) !void {
         break :blk code_buf[0..argv[2].len];
     } else argv[2];
     const both = std.mem.eql(u8, verb, "install") and !no_base;
-    const code_last = argv[2];
     const targets: []const []const u8 =
         if (both and std.mem.eql(u8, code, "D2XP")) &.{ "D2DV", "D2XP" } else if (both and std.mem.eql(u8, code, "W3XP")) &.{ "WAR3", "W3XP" } else &.{argv[2]};
 
     // Both halves land in one game directory, named for what was actually asked for.
     const game_root = game_dir orelse try std.fmt.allocPrint(gpa, "{s}/{s}-game", .{ dir_path, meta.name });
 
-    for (targets) |target| {
+    for (targets, 0..) |target, pass| {
         // Resolve every target, not just the ones that differ by name: the base pass overwrites
         // `meta`, so the expansion pass cannot reuse what was resolved before the loop.
         if (targets.len > 1) {
@@ -596,7 +617,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (failed != 0) return error.Incomplete;
 
-        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language, if (std.mem.eql(u8, target, code_last)) want_version else null, patch_source, &client);
+        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language, if (pass + 1 == targets.len) want_version else null, patch_source, &client);
     } // end of the per-product loop
 }
 
@@ -652,9 +673,14 @@ fn patchTo(
     }
 
     var wrote: usize = 0;
+    var unchanged: usize = 0;
     if (disk_map) |text| {
         for (try ptc.parseMap(gpa, text)) |m| {
-            const rec_bytes = patch.read(gpa, m.member) catch continue;
+            // A file the patch does not carry is one it does not change; the installed copy stays.
+            const rec_bytes = patch.read(gpa, m.member) catch {
+                unchanged += 1;
+                continue;
+            };
             const rec = ptc.Record.parse(rec_bytes) catch continue;
             const name = m.basename();
 
@@ -677,14 +703,53 @@ fn patchTo(
 
     // patch_d2.mpq is rebuilt from nothing, exactly as the script asks.
     var rebuilt: usize = 0;
+    var short: usize = 0;
     if (patch.read(gpa, "patch.lst")) |lst| {
-        var members: std.ArrayList(mpq.NewFile) = .empty;
+        // Here the pair is the other way round: archive path first, member second.
+        const Wanted = struct { name: []const u8, rec: ptc.Record, data: ?[]const u8 };
+        var want: std.ArrayList(Wanted) = .empty;
+        var deltas: usize = 0;
         for (try ptc.parseMap(gpa, lst)) |m| {
-            // Here the pair is the other way round: archive path first, member second.
-            const data = patch.read(gpa, m.destination) catch continue;
-            const rec = ptc.Record.parse(data) catch continue;
-            const body = ptc.apply(gpa, rec, &[_]u8{}) catch continue;
-            try members.append(gpa, .{ .name = m.member, .data = body });
+            const bytes = patch.read(gpa, m.destination) catch continue;
+            const rec = ptc.Record.parse(bytes) catch continue;
+            if (rec.src_size == 0) {
+                const body = ptc.apply(gpa, rec, &[_]u8{}) catch continue;
+                try want.append(gpa, .{ .name = m.member, .rec = rec, .data = body });
+            } else {
+                deltas += 1;
+                try want.append(gpa, .{ .name = m.member, .rec = rec, .data = null });
+            }
+        }
+
+        // Most members of patch_d2.mpq are deltas against the file the game reads today, so the
+        // source comes out of the installed archives — `data\global\excel\armor.bin` against the
+        // copy in d2exp.mpq, and so on. They are searched in the game's own order, one at a time so
+        // that a quarter-gigabyte archive is never held for longer than it is being read, and
+        // patch_d2.mpq is not among them: the script deletes it before any of this.
+        const order = [_][]const u8{
+            "d2exp.mpq",    "d2xtalk.mpq", "d2xmusic.mpq", "d2xvideo.mpq", "d2data.mpq",
+            "d2char.mpq",   "d2sfx.mpq",   "d2music.mpq",  "d2speech.mpq", "d2video.mpq",
+        };
+        for (order) |archive_name| {
+            if (deltas == 0) break;
+            const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
+            defer gpa.free(path);
+            const bytes = readFile(gpa, io, path) catch continue;
+            defer gpa.free(bytes);
+            var have = mpq.Archive.open(gpa, bytes) catch continue;
+            defer have.deinit(gpa);
+            for (want.items) |*w| {
+                if (w.data != null) continue;
+                const src = have.read(gpa, w.name) catch continue;
+                defer gpa.free(src);
+                w.data = ptc.apply(gpa, w.rec, src) catch continue;
+                deltas -= 1;
+            }
+        }
+
+        var members: std.ArrayList(mpq.NewFile) = .empty;
+        for (want.items) |w| {
+            if (w.data) |d| try members.append(gpa, .{ .name = w.name, .data = d }) else short += 1;
         }
         if (members.items.len != 0) {
             var slots: u32 = 16;
@@ -697,7 +762,8 @@ fn patchTo(
         }
     } else |_| {}
 
-    std.debug.print("  {d} files patched, patch_d2.mpq rebuilt with {d} members\n", .{ wrote, rebuilt });
+    std.debug.print("  {d} files patched, {d} left as installed, patch_d2.mpq rebuilt with {d} members\n", .{ wrote, unchanged, rebuilt });
+    if (short != 0) std.debug.print("  {d} members of patch_d2.mpq could not be rebuilt\n", .{short});
 }
 
 /// Build the game directory from a payload that has just been fetched.
