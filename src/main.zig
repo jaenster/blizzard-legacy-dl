@@ -10,6 +10,8 @@ const proxy = @import("proxy.zig");
 const mpq = @import("libd2").formats.mpq;
 const script = @import("libd2").formats.installer;
 const ptc = @import("libd2").formats.ptc;
+const keystore = @import("libd2").bnet.keystore;
+const cdkey = @import("libd2").bnet.cdkey;
 
 const usage =
     \\blizzard-legacy-dl — read a Blizzard legacy downloader stub and fetch its payload
@@ -37,6 +39,10 @@ const usage =
     \\                 blizzard-legacy-dl/. -o overrides it; fetch and run still use the cwd.
     \\  --no-base      install an expansion on its own, without its base game first
     \\  --version <v>  install an older version, e.g. 1.09b (or give it as the 3rd argument)
+    \\  --cdkey <key>  the classic CD key, stored where the game keeps it
+    \\  --cdkey-expansion <key>
+    \\                 the expansion key; the two are different keys
+    \\  --owner <name> the account name stored beside them
     \\  --patch-source where patch archives come from
     \\  --platform <p> win32 (default) or macos, for install
     \\  --lang <name>  install this language branch (default English)
@@ -183,6 +189,7 @@ pub fn main(init: std.process.Init) !void {
     var patch_source: []const u8 = "https://files.typeguru.nl/diablo/patches/pc";
     var platform: []const u8 = "win32";
     var language: []const u8 = "English";
+    var secrets: Secrets = .{};
     var i: usize = 3;
     if (argv.len > 3 and argv[3].len != 0 and (std.ascii.isDigit(argv[3][0]))) {
         want_version = argv[3];
@@ -232,6 +239,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--lang") and i + 1 < argv.len) {
             i += 1;
             language = argv[i];
+        } else if (std.mem.eql(u8, a, "--cdkey") and i + 1 < argv.len) {
+            i += 1;
+            secrets.classic = argv[i];
+            checkKey("classic", argv[i]);
+        } else if (std.mem.eql(u8, a, "--cdkey-expansion") and i + 1 < argv.len) {
+            i += 1;
+            secrets.expansion = argv[i];
+            checkKey("expansion", argv[i]);
+        } else if (std.mem.eql(u8, a, "--owner") and i + 1 < argv.len) {
+            i += 1;
+            secrets.owner = argv[i];
         } else if (std.mem.eql(u8, a, "--cookie") and i + 1 < argv.len) {
             i += 1;
             cookie_override = argv[i];
@@ -617,7 +635,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (failed != 0) return error.Incomplete;
 
-        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language, if (pass + 1 == targets.len) want_version else null, patch_source, &client);
+        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language, if (pass + 1 == targets.len) want_version else null, patch_source, secrets, &client);
     } // end of the per-product loop
 }
 
@@ -771,6 +789,53 @@ fn patchTo(
 /// The payload's archives hold both the files and the script saying where they go. Everything the
 /// script asks for that has meaning off Windows is done; the registry keys, shortcuts and DirectX
 /// bundle it also asks for are counted and reported instead.
+/// The values the install script asks to be hidden inside the game's own archives: the CD keys
+/// and the account name. None of them is a file the payload carries — the real installer prompts
+/// for them and encrypts what it is told, which is why nothing here comes out of the Tome.
+///
+/// A key is per-product and the two are NOT interchangeable: classic and expansion are separate
+/// keys, sixteen or twenty-six characters, written to different archives. The script says which
+/// one each `encrypt` wants, so the caller supplies both and the manifest does the choosing.
+const Secrets = struct {
+    classic: ?[]const u8 = null,
+    expansion: ?[]const u8 = null,
+    owner: ?[]const u8 = null,
+
+    fn any(self: Secrets) bool {
+        return self.classic != null or self.expansion != null or self.owner != null;
+    }
+
+    /// What this `encrypt` should store, or null if the caller gave nothing for it. The owner name
+    /// carries no product id, which is exactly how it is told apart from a key.
+    fn textFor(self: Secrets, object: []const u8, product_id: ?u16) ?[]const u8 {
+        if (std.mem.eql(u8, object, "user")) return self.owner;
+        if (!std.mem.startsWith(u8, object, "cdkey")) return null;
+        return switch (product_id orelse return null) {
+            @intFromEnum(keystore.Product.classic) => self.classic,
+            @intFromEnum(keystore.Product.expansion) => self.expansion,
+            else => null,
+        };
+    }
+};
+
+/// Say so when a key is not one the game would accept, rather than writing it and leaving the
+/// rejection to happen later at a Battle.net login with nothing pointing back here.
+///
+/// This warns rather than refuses. The check is ours, not the game's, and a private realm is free
+/// to want a key that Blizzard's own numbering would not issue; refusing would block that for no
+/// gain, while saying nothing would hide a typo until it costs an hour.
+fn checkKey(kind: []const u8, key: []const u8) void {
+    const ok = switch (key.len) {
+        16 => cdkey.decode16(key) != null,
+        26 => cdkey.decode26(key) != null,
+        else => {
+            std.debug.print("  !! the {s} key is {d} characters; a Diablo II key is 16 or 26\n", .{ kind, key.len });
+            return;
+        },
+    };
+    if (!ok) std.debug.print("  !! the {s} key does not decode — check it for a typo\n", .{kind});
+}
+
 fn install(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -780,6 +845,7 @@ fn install(
     language: []const u8,
     version: ?[]const u8,
     patch_source: []const u8,
+    secrets: Secrets,
     client: *std.http.Client,
 ) !void {
     // The script names its own archives Tome1..Tome6; a payload has one of them, or a few.
@@ -817,8 +883,20 @@ fn install(
 
     var wrote: usize = 0;
     var added: usize = 0;
+    var hidden: usize = 0;
     var elsewhere: usize = 0;
-    var pending: std.ArrayList(@TypeOf(@as(script.Op, undefined).add_to_archive)) = .empty;
+
+    // Everything bound for an archive, gathered per container so each one is rewritten once.
+    // Members and encrypted values go through the same door on purpose: they land in the same
+    // archives, and a 250 MB archive rewritten twice for two kinds of write is 250 MB of waste.
+    var bound: std.StringArrayHashMapUnmanaged(std.ArrayList(mpq.NewFile)) = .empty;
+    const bind = struct {
+        fn add(a: std.mem.Allocator, m: *std.StringArrayHashMapUnmanaged(std.ArrayList(mpq.NewFile)), container: []const u8, f: mpq.NewFile) !void {
+            const slot = try m.getOrPut(a, container);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            try slot.value_ptr.append(a, f);
+        }
+    }.add;
 
     for (plan.ops) |op| switch (op) {
         .extract => |f| {
@@ -836,7 +914,29 @@ fn install(
             try writeWhole(io, full, data);
             wrote += 1;
         },
-        .add_to_archive => |a| try pending.append(gpa, a),
+        .add_to_archive => |a| {
+            const from = a.file.from orelse continue;
+            const data = set.read(gpa, from) catch continue;
+            try bind(gpa, &bound, a.container, .{ .name = a.file.to, .data = data });
+        },
+        .encrypt => |e| {
+            const container = e.container orelse {
+                elsewhere += 1;
+                continue;
+            };
+            const text = secrets.textFor(e.object, e.product_id) orelse {
+                elsewhere += 1;
+                continue;
+            };
+            // The wrapping password is fixed for every install on earth, so nothing about this
+            // depends on the machine it runs on: the same key produces a blob any copy reads.
+            const pw = keystore.blockKey();
+            const blob = try gpa.alloc(u8, keystore.wrappedLen(text.len));
+            keystore.encrypt(blob, text, &pw);
+            try bind(gpa, &bound, container, .{ .name = e.into, .data = blob });
+            std.debug.print("  storing {s} in {s}\n", .{ e.object, container });
+            hidden += 1;
+        },
         .delete => |path| {
             const rel = try gpa.dupe(u8, path);
             defer gpa.free(rel);
@@ -852,30 +952,20 @@ fn install(
     };
 
     // One rewrite per archive, carrying every member bound for it.
-    var done_containers: std.StringHashMapUnmanaged(void) = .empty;
-    for (pending.items) |a| {
-        if (done_containers.contains(a.container)) continue;
-        try done_containers.put(gpa, a.container, {});
-        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, a.container });
+    for (bound.keys(), bound.values()) |container, list| {
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, container });
         defer gpa.free(path);
         const before = readFile(gpa, io, path) catch continue;
         defer gpa.free(before);
-
-        var add: std.ArrayList(mpq.NewFile) = .empty;
-        defer add.deinit(gpa);
-        for (pending.items) |b| {
-            if (!std.mem.eql(u8, b.container, a.container)) continue;
-            const from = b.file.from orelse continue;
-            const data = set.read(gpa, from) catch continue;
-            try add.append(gpa, .{ .name = b.file.to, .data = data });
-        }
-        const grown = mpq.append(gpa, before, add.items) catch continue;
+        const grown = mpq.append(gpa, before, list.items) catch continue;
         defer gpa.free(grown);
         try writeWhole(io, path, grown);
-        added += add.items.len;
+        added += list.items.len;
     }
 
     std.debug.print("{d} files, {d} members added to installed archives, {d} steps only Windows can do\n", .{ wrote, added, elsewhere });
+    if (secrets.any() and hidden == 0)
+        std.debug.print("!! nothing was stored: this script asks for no value the given options supply\n", .{});
 
     if (version) |v| try patchTo(gpa, io, client, &set, game, v, found > 0 and set.has("PC-100x\\Game.exe"), patch_source);
     std.debug.print("the game is in {s}\n", .{game});
