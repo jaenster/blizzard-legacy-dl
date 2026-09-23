@@ -15,3 +15,6 @@ build/
 d2dv-*/
 d2xp-*/
 *-game/
+
+# zig 0.16 package cache
+zig-pkg/

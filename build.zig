@@ -42,6 +42,10 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = legacy });
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
+    // the installer's own archive surgery, over archives built in memory
+    const cli_tests = b.addTest(.{ .root_module = cli.root_module });
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+
     // fetch, verify and reassembly against a payload built and served on the spot
     const e2e = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/e2e.zig"),

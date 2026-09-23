@@ -129,6 +129,13 @@ different starting points: a classic patch applies to the 1.00 files, an expansi
 beyond the patch itself. `patch_d2.mpq` is rebuilt from scratch rather than patched, since most of
 its members are deltas against files spread across the other archives.
 
+One archive needs more than patching. Of the archives the 1.14b payload carries, only `d2sfx.mpq`
+has an `(attributes)` member in the 1.14 format: zlib-compressed, with an MD5 column. Before 1.14
+the game reads its archives through its own `Storm.dll`, which opens `(attributes)` along with the
+archive and cannot inflate zlib — so it stops at startup with "The file data is corrupt. File:
+d2sfx.mpq". An older install therefore takes that member out of the archive's hash table. Storm.dll
+could not have used it anyway: the MD5 column makes it a size its loader rejects.
+
 Payloads are cached and shared between versions — installing four versions downloads once. The
 cache lives under `$BLIZZARD_LEGACY_DL_CACHE`, else `$XDG_CACHE_HOME` or `~/.cache`.
 
@@ -145,7 +152,8 @@ blizzard-legacy-dl install D2XP --game ./d2 \
 
 Classic and expansion are different keys and go to different archives. Which archive is not
 guessed — it comes from the install script, so a payload that names another one is followed as it
-stands. Leave the options off and no key is stored, exactly as before.
+stands. Leave the options off and no key is stored; the game still starts, since the key only
+matters to Battle.net.
 
 ## The access token
 

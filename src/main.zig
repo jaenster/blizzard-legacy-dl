@@ -639,6 +639,13 @@ pub fn main(init: std.process.Init) !void {
     } // end of the per-product loop
 }
 
+/// The archives an install lays down, in the order the game searches them. `patch_d2.mpq` is not
+/// among them: the patch rebuilds that one outright.
+const installed_archives = [_][]const u8{
+    "d2exp.mpq",  "d2xtalk.mpq", "d2xmusic.mpq", "d2xvideo.mpq", "d2data.mpq",
+    "d2char.mpq", "d2sfx.mpq",   "d2music.mpq",  "d2speech.mpq", "d2video.mpq",
+};
+
 /// Take a game directory back to an older version, the way Blizzard's patch installer does.
 ///
 /// The payload carries the original build of each product — 1.00 for the base game, 1.07 for the
@@ -744,11 +751,7 @@ fn patchTo(
         // copy in d2exp.mpq, and so on. They are searched in the game's own order, one at a time so
         // that a quarter-gigabyte archive is never held for longer than it is being read, and
         // patch_d2.mpq is not among them: the script deletes it before any of this.
-        const order = [_][]const u8{
-            "d2exp.mpq",    "d2xtalk.mpq", "d2xmusic.mpq", "d2xvideo.mpq", "d2data.mpq",
-            "d2char.mpq",   "d2sfx.mpq",   "d2music.mpq",  "d2speech.mpq", "d2video.mpq",
-        };
-        for (order) |archive_name| {
+        for (installed_archives) |archive_name| {
             if (deltas == 0) break;
             const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
             defer gpa.free(path);
@@ -794,6 +797,95 @@ fn patchTo(
 
     std.debug.print("  {d} files patched, {d} left as installed, patch_d2.mpq rebuilt with {d} members\n", .{ wrote, unchanged, rebuilt });
     if (short != 0) std.debug.print("  {d} members of patch_d2.mpq could not be rebuilt\n", .{short});
+
+    // Only a version that ships its own Storm.dll reads the archives through it; 1.14 links its
+    // archive code into Game.exe and reads everything the payload carries.
+    if (fileExists(io, game, "Storm.dll")) {
+        for (installed_archives) |archive_name| {
+            const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
+            defer gpa.free(path);
+            const bytes = readFile(gpa, io, path) catch continue;
+            defer gpa.free(bytes);
+            if (!try unhookModernAttributes(gpa, bytes)) continue;
+            try writeWhole(io, path, bytes);
+            std.debug.print("  {s}: unlisted its (attributes), which this version's Storm.dll cannot read\n", .{archive_name});
+        }
+    }
+}
+
+fn fileExists(io: std.Io, dir: []const u8, name: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const f = openFile(io, full, .read_only) catch return false;
+    f.close(io);
+    return true;
+}
+
+/// What an `(attributes)` member may carry for the Storm.dll a pre-1.14 version ships: a CRC32 and
+/// a FILETIME per block. Its loader sizes the member as 8 + 12 bytes a block and ignores
+/// anything else.
+const storm_dll_attributes: u32 = 0x1 | 0x2;
+
+/// A hash-table slot whose member is gone. Unlike an empty slot, a lookup probes past it, so the
+/// names that collided behind it stay reachable.
+const deleted_slot: u32 = 0xFFFF_FFFE;
+
+/// Take a 1.14-format `(attributes)` out of an archive's hash table, in place. True if there was
+/// one to take.
+///
+/// Every older version is built from the 1.14b payload, and of the archives it carries only
+/// `d2sfx.mpq` has its `(attributes)` in the 1.14 format: zlib-compressed with per-sector CRCs, and
+/// carrying an MD5 per block besides. Its listfile is zlib too, but nothing reads that at startup. Storm.dll opens
+/// `(attributes)` inside `SFileOpenArchive`, and the Storm.dll 1.13c ships decompresses Huffman,
+/// PKWARE and the two ADPCM codecs and nothing else. A zlib sector falls through to Storm's fatal
+/// error 0x85100083, reported against the archive:
+///
+///     This application has encountered a critical error: The file data is corrupt.
+///     File: d2sfx.mpq
+///
+/// That reads as a damaged download, or as a missing CD key, and is neither. It is also not about
+/// reading `(attributes)` too strictly: the same member would be discarded a moment later anyway,
+/// because with the MD5 column it is not the 8 + 12-per-block size that loader accepts. So the
+/// member is worth nothing to that engine, and only having it listed kills the boot.
+///
+/// The test is on the content rather than on the archive's name, so a `(attributes)` the old
+/// Storm can use — the ones in `d2exp.mpq` and the other expansion archives, which carry only the
+/// CRC32 and FILETIME columns — keeps its checksums. Only the hash entry changes; the bytes
+/// stay where they are, unreferenced, and the archive keeps its size and every member its offset.
+fn unhookModernAttributes(gpa: std.mem.Allocator, bytes: []u8) !bool {
+    var arc = mpq.Archive.open(gpa, bytes) catch return false;
+    defer arc.deinit(gpa);
+
+    const attrs = arc.read(gpa, "(attributes)") catch return false;
+    defer gpa.free(attrs);
+    if (attrs.len < 8) return false;
+    const carries = std.mem.readInt(u32, attrs[4..8], .little);
+    if (carries & ~storm_dll_attributes == 0) return false;
+
+    const mask: u32 = @intCast(arc.hashes.len - 1);
+    const a = mpq.hashString("(attributes)", .name_a);
+    const b = mpq.hashString("(attributes)", .name_b);
+    var slot = mpq.hashString("(attributes)", .table_offset) & mask;
+    var probes: u32 = 0;
+    const found = while (probes <= mask) : (probes += 1) {
+        const e = arc.hashes[slot];
+        if (e.block_index == 0xFFFF_FFFF) return false;
+        if (e.block_index != deleted_slot and e.name_a == a and e.name_b == b) break slot;
+        slot = (slot + 1) & mask;
+    } else return false;
+    arc.hashes[found].block_index = deleted_slot;
+
+    const table = bytes[arc.base + arc.header.hash_table_pos ..][0 .. arc.hashes.len * 16];
+    for (arc.hashes, 0..) |e, i| {
+        const r = table[i * 16 ..][0..16];
+        std.mem.writeInt(u32, r[0..4], e.name_a, .little);
+        std.mem.writeInt(u32, r[4..8], e.name_b, .little);
+        std.mem.writeInt(u16, r[8..10], e.locale, .little);
+        std.mem.writeInt(u16, r[10..12], e.platform, .little);
+        std.mem.writeInt(u32, r[12..16], e.block_index, .little);
+    }
+    mpq.encrypt(table, mpq.hashString("(hash table)", .file_key));
+    return true;
 }
 
 /// Build the game directory from a payload that has just been fetched.
@@ -1286,4 +1378,42 @@ fn readPiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, io: std.Io, dest: []
         at += try f.readPositionalAll(io, buf[at..][0..n], s.offset);
     }
     return buf[0..at];
+}
+
+test "only an (attributes) the old Storm.dll cannot use is unlisted, and nothing else moves" {
+    const gpa = std.testing.allocator;
+    const Case = struct { carries: u32, unlisted: bool };
+    for ([_]Case{
+        .{ .carries = 0x7, .unlisted = true }, // CRC32, FILETIME and MD5, as the 1.14 d2sfx.mpq has
+        .{ .carries = 0x3, .unlisted = false }, // CRC32 and FILETIME, as d2exp.mpq has
+    }) |case| {
+        var attrs: [8]u8 = undefined;
+        std.mem.writeInt(u32, attrs[0..4], 100, .little);
+        std.mem.writeInt(u32, attrs[4..8], case.carries, .little);
+
+        const empty = try mpq.empty(gpa, 16);
+        defer gpa.free(empty);
+        const built = try mpq.append(gpa, empty, &.{
+            .{ .name = "data\\global\\sfx\\cursor\\button.wav", .data = "RIFF" },
+            .{ .name = "(attributes)", .data = &attrs },
+        });
+        defer gpa.free(built);
+        const before = try gpa.dupe(u8, built);
+        defer gpa.free(before);
+
+        try std.testing.expectEqual(case.unlisted, try unhookModernAttributes(gpa, built));
+        try std.testing.expectEqual(before.len, built.len);
+
+        var arc = try mpq.Archive.open(gpa, built);
+        defer arc.deinit(gpa);
+        try std.testing.expectEqual(!case.unlisted, arc.lookup("(attributes)") != null);
+        const wav = try arc.read(gpa, "data\\global\\sfx\\cursor\\button.wav");
+        defer gpa.free(wav);
+        try std.testing.expectEqualStrings("RIFF", wav);
+        // Everything outside the hash table is untouched.
+        const table_at = arc.base + arc.header.hash_table_pos;
+        try std.testing.expectEqualSlices(u8, before[0..table_at], built[0..table_at]);
+        const table_end = table_at + arc.hashes.len * 16;
+        try std.testing.expectEqualSlices(u8, before[table_end..], built[table_end..]);
+    }
 }
