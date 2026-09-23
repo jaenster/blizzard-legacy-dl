@@ -1,6 +1,6 @@
 .{
     .name = .blizzard_legacy_dl,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .dependencies = .{
         .libd2 = .{
             .url = "git+https://github.com/jaenster/libd2#8c64e0dc559d06cfccf9c012d78dafcb3da1a839",
