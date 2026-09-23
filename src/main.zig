@@ -1073,6 +1073,30 @@ fn install(
 
     if (version) |v| try patchTo(gpa, io, client, &set, game, v, found > 0 and set.has("PC-100x\\Game.exe"), patch_source);
     std.debug.print("the game is in {s}\n", .{game});
+    if (version) |v| if (copyProtected(v)) std.debug.print(
+        \\
+        \\!! {s} will not start on current Windows, and nothing is missing from the install.
+        \\   Its Game.exe is Blizzard's, wrapped in SafeDisc: the copy protection on every Diablo II
+        \\   client before 1.12. It wants the play disc, read through a driver Windows 10 and later no
+        \\   longer ship; without them it exits within seconds, with no window and exit code 2. 1.12a
+        \\   and later carry no copy protection.
+        \\
+    , .{v});
+}
+
+/// Whether the Windows `Game.exe` of a version is wrapped in SafeDisc. Every client from 1.00 to
+/// 1.11b is (sections `.cms_t`/`.cms_d`, later randomly named ones); 1.12a dropped the disc check
+/// and with it the wrapper. Versions are written `1.09b`, so the two digits after `1.` decide.
+fn copyProtected(version: []const u8) bool {
+    if (!std.mem.startsWith(u8, version, "1.")) return false;
+    var minor: u32 = 0;
+    var digits: usize = 0;
+    for (version[2..]) |c| {
+        if (c < '0' or c > '9') break;
+        minor = minor * 10 + (c - '0');
+        digits += 1;
+    }
+    return digits != 0 and minor < 12;
 }
 
 /// A piece map, the way a torrent client draws one: a grid of cells, each standing for a run of
@@ -1378,6 +1402,13 @@ fn readPiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, io: std.Io, dest: []
         at += try f.readPositionalAll(io, buf[at..][0..n], s.offset);
     }
     return buf[0..at];
+}
+
+test "every version before 1.12a is flagged as copy-protected, and none after" {
+    for ([_][]const u8{ "1.00", "1.06b", "1.07", "1.09b", "1.09d", "1.10", "1.11b" }) |v|
+        try std.testing.expect(copyProtected(v));
+    for ([_][]const u8{ "1.12a", "1.13c", "1.13d", "1.14b", "1.14d", "", "1.", "2.4" }) |v|
+        try std.testing.expect(!copyProtected(v));
 }
 
 test "only an (attributes) the old Storm.dll cannot use is unlisted, and nothing else moves" {

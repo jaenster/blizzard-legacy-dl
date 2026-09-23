@@ -136,6 +136,14 @@ archive and cannot inflate zlib — so it stops at startup with "The file data i
 d2sfx.mpq". An older install therefore takes that member out of the archive's hash table. Storm.dll
 could not have used it anyway: the MD5 column makes it a size its loader rejects.
 
+Versions before 1.12 install fine but will not start on current Windows. Their `Game.exe` is
+Blizzard's own, wrapped in SafeDisc — the copy protection on every Diablo II client from 1.00 to
+1.11b. It wants the play disc, read through a driver Windows 10 and later no longer ship, and without
+them it exits within seconds: no window, exit code 2, before any of the game's own code runs. Nothing
+is missing from the install, and `install` says so when it builds one of these versions. 1.12a
+dropped the disc check and the wrapper with it, so 1.12a and later start from the directory alone.
+This tool does not remove copy protection.
+
 Payloads are cached and shared between versions — installing four versions downloads once. The
 cache lives under `$BLIZZARD_LEGACY_DL_CACHE`, else `$XDG_CACHE_HOME` or `~/.cache`.
 
