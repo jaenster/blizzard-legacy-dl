@@ -295,6 +295,37 @@ pub fn plainRelative(rel: []const u8) bool {
     return true;
 }
 
+test "a request that stalls is abandoned at its deadline" {
+    // A server that accepts, reads the request and then says nothing.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+    const Srv = struct {
+        fn run(s: *std.Io.net.Server, i: std.Io) void {
+            var conn = s.accept(i) catch return;
+            std.Io.sleep(i, .fromMilliseconds(1500), .awake) catch {};
+            conn.close(i);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Srv.run, .{ &server, io });
+    defer t.join();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/0", .{port});
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, fetchWithin(arena.allocator(), io, &client, url, null, 300));
+    const took = start.untilNow(io, .awake).toMilliseconds();
+    try std.testing.expect(took < 1400);
+}
+
 test "only plain relative names are deleted" {
     for ([_][]const u8{ "D2Debug.txt", "support/x.txt", "Diablo II.lnk" }) |p| try std.testing.expect(plainRelative(p));
     for ([_][]const u8{ "", "/x", "D2Debug*.txt", "$(ProgramMenu)/x.lnk", "C:/x", "../x", "a//b", "a/./b", "a?b" }) |p| try std.testing.expect(!plainRelative(p));
@@ -537,6 +568,44 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
     return res;
 }
 
+/// How long one piece (256 KiB) may take before its request is abandoned and tried again on a fresh connection.
+/// A CDN connection can stay open and send nothing; without a limit the whole download waits on it forever.
+pub const piece_timeout_ms: u64 = 60_000;
+
+/// `fetchUrl`, abandoned (its request cancelled, the socket read interrupted) when it takes longer than
+/// `timeout_ms`: error.Timeout. `gpa` should be an arena: a body that completes as the timeout fires is not
+/// freed.
+pub fn fetchWithin(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, timeout_ms: u64) ![]u8 {
+    const U = union(enum) {
+        body: anyerror![]u8,
+        timeout: std.Io.Cancelable!void,
+    };
+    var buf: [2]U = undefined;
+    var sel: std.Io.Select(U) = .init(io, &buf);
+    const Fetcher = struct {
+        fn run(g: std.mem.Allocator, c: *std.http.Client, u: []const u8, k: ?[]const u8) anyerror![]u8 {
+            return fetchUrl(g, c, u, k);
+        }
+        fn wait(i: std.Io, ms: u64) std.Io.Cancelable!void {
+            return std.Io.sleep(i, .fromMilliseconds(@intCast(ms)), .awake);
+        }
+    };
+    // No unit of concurrency to spare: fetch without a limit rather than not at all.
+    sel.concurrent(.body, Fetcher.run, .{ gpa, client, url, cookie }) catch return fetchUrl(gpa, client, url, cookie);
+    sel.concurrent(.timeout, Fetcher.wait, .{ io, timeout_ms }) catch {
+        const only = try sel.await();
+        return only.body;
+    };
+    const first = try sel.await();
+    // The other one is cancelled and waited for; a body that finished anyway lives in `gpa` (the caller's
+    // per-piece arena), so it is simply dropped.
+    _ = sel.cancel();
+    return switch (first) {
+        .body => |b| b,
+        .timeout => error.Timeout,
+    };
+}
+
 /// The shared state a set of fetch workers pulls from. The piece cursor is a fetch-and-add, so a
 /// worker only ever needs the next index and never waits on the others; the counters move under
 /// the reporter's lock, so the events they produce are in order.
@@ -614,11 +683,18 @@ const Fetch = struct {
                 // Each retry moves to the next server whose range covers this piece, so a
                 // mirror that is down costs one attempt rather than every attempt.
                 const url = f.meta.pieceUrlFrom(scratch, p, s, attempt) catch continue;
-                const body = fetchUrl(scratch, &client, url, f.cookie) catch |e| {
+                const body = fetchWithin(scratch, io, &client, url, f.cookie, piece_timeout_ms) catch |e| {
                     last_err = if (e == error.HttpStatus)
                         std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
                     else
                         @errorName(e);
+                    if (e == error.Timeout) {
+                        // A connection that went quiet: drop every pooled connection, so the retry dials anew.
+                        client.deinit();
+                        client = .{ .allocator = stable, .io = io };
+                    }
+                    // A little longer between tries each time.
+                    std.Io.sleep(io, .fromMilliseconds(@intCast(250 * (attempt + 1))), .awake) catch {};
                     continue;
                 };
                 if (body.len != want) {
