@@ -1,7 +1,8 @@
 //! A server that answers and then goes silent must not hold a piece fetch past its deadline, on any
 //! platform, and the piece must still arrive on a retry against a server that answers.
 //! `zig build stall-test` runs it here; `zig build stall-test -Dtarget=x86_64-windows-gnu` installs
-//! zig-out/bin/stall-test.exe to run on Windows.
+//! zig-out/bin/stall-test.exe to run on Windows. STALL_HOST=127.0.0.1 (or a name of this machine)
+//! adds the many-pieces run that wedged a worker on Windows; STALL_JOBS sets its worker count.
 const std = @import("std");
 const installer = @import("installer");
 const legacy = @import("legacy");
@@ -89,7 +90,11 @@ fn pattern() []const u8 {
 }
 
 fn startServer(io: std.Io, s: *Server, plan: []const Mode) !std.Thread {
-    const addr: std.Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    return startServerOn(io, s, plan, "127.0.0.1");
+}
+
+fn startServerOn(io: std.Io, s: *Server, plan: []const Mode, bind: []const u8) !std.Thread {
+    const addr: std.Io.net.IpAddress = try .parse(bind, 0);
     s.* = .{ .listener = try addr.listen(io, .{ .reuse_address = true }), .port = 0, .plan = plan };
     s.port = s.listener.socket.address.getPort();
     return std.Thread.spawn(.{}, Server.run, .{s});
@@ -105,6 +110,8 @@ fn stopServer(io: std.Io, s: *Server, t: std.Thread) void {
     s.listener.deinit(io);
 }
 
+var current_server: ?*Server = null;
+
 /// Kills the test process if a fetch outlives any reasonable deadline, so a hang is a failure and
 /// not a test run that never ends.
 fn watchdog(done: *std.atomic.Value(bool), what: []const u8) void {
@@ -115,7 +122,8 @@ fn watchdog(done: *std.atomic.Value(bool), what: []const u8) void {
     while (!done.load(.acquire)) : (waited += 1) {
         std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
         if (waited == 450) {
-            std.debug.print("HANG: {s} still running after 45 s\n", .{what});
+            std.debug.print("HANG: {s} still running after 45 s, {d} connections accepted\n", .{ what, if (current_server) |cs| cs.accepted.load(.monotonic) else 0 });
+            if (@import("builtin").os.tag == .windows) dumpThreads();
             std.process.exit(3);
         }
     }
@@ -126,7 +134,8 @@ fn nowMs(io: std.Io) i64 {
 }
 
 fn expectTimeout(mode: Mode) !void {
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    var threaded: std.Io.Threaded = undefined;
+    installer.workerIo(&threaded);
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -168,6 +177,11 @@ test "a server that goes silent mid-body times the fetch out" {
 
 /// A one-piece payload of `pattern()` whose only mirror is the test server, fetched into a fresh directory.
 fn fetchOnePiece(plan: []const Mode, retries: usize, timeout_ms: u64) !struct { installer.FetchResult, usize, i64 } {
+    return fetchPieces(plan, retries, timeout_ms, 1, "127.0.0.1", 1);
+}
+
+/// `count` pieces, every one of them `pattern()`, from `host` (which must resolve to this machine).
+fn fetchPieces(plan: []const Mode, retries: usize, timeout_ms: u64, count: usize, host: []const u8, jobs: usize) !struct { installer.FetchResult, usize, i64 } {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -176,7 +190,9 @@ fn fetchOnePiece(plan: []const Mode, retries: usize, timeout_ms: u64) !struct { 
     const io = threaded.io();
 
     var server: Server = undefined;
-    const st = try startServer(io, &server, plan);
+    current_server = &server;
+    defer current_server = null;
+    const st = try startServerOn(io, &server, plan, if (std.mem.eql(u8, host, "127.0.0.1")) "127.0.0.1" else "0.0.0.0");
     defer {
         stopServer(io, &server, st);
     }
@@ -193,12 +209,12 @@ fn fetchOnePiece(plan: []const Mode, retries: usize, timeout_ms: u64) !struct { 
     const w = &t.writer;
     try w.print("d8:announce{d}:{s}", .{ "http://tracker.invalid/announce".len, "http://tracker.invalid/announce" });
     try w.print("15:direct download{d}:{s}", .{ "http://127.0.0.1/x".len, "http://127.0.0.1/x" });
-    try w.print("4:infod5:filesld6:lengthi{d}e4:pathl9:piece.binee", .{body_len});
-    try w.print("e4:name5:Stall12:piece lengthi{d}e6:pieces20:", .{body_len});
-    try w.writeAll(&d);
+    try w.print("4:infod5:filesld6:lengthi{d}e4:pathl9:piece.binee", .{body_len * count});
+    try w.print("e4:name5:Stall12:piece lengthi{d}e6:pieces{d}:", .{ body_len, 20 * count });
+    for (0..count) |_| try w.writeAll(&d);
     try w.writeAll("ee");
     var meta = try legacy.fromStub(gpa, t.written());
-    var mirrors = [_]legacy.Server{.{ .url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port}) }};
+    var mirrors = [_]legacy.Server{.{ .url = try std.fmt.allocPrint(gpa, "http://{s}:{d}", .{ host, server.port }) }};
     meta.servers = &mirrors;
 
     var tmp = std.testing.tmpDir(.{});
@@ -211,11 +227,11 @@ fn fetchOnePiece(plan: []const Mode, retries: usize, timeout_ms: u64) !struct { 
     const t0 = nowMs(io);
     const res = try installer.fetchPayload(gpa, io, meta, dest, .{
         .retries = retries,
-        .jobs = 1,
+        .jobs = jobs,
         .piece_timeout_ms = timeout_ms,
     }, &rep);
     const took = nowMs(io) - t0;
-    if (res.done == 1) {
+    if (res.done == 1 and count == 1) {
         const path = try std.fs.path.join(gpa, &.{ dest, "piece.bin" });
         const got = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
         try std.testing.expectEqualSlices(u8, pattern(), got);
@@ -239,4 +255,62 @@ test "a piece whose every connection goes silent fails once its retries are spen
     try std.testing.expectEqual(@as(usize, 1), res.failed);
     try std.testing.expectEqual(@as(usize, 2), conns);
     try std.testing.expect(took < 15_000);
+}
+
+test "400 pieces over four workers, a fresh connection for each, never wedge a worker (STALL_HOST)" {
+    const host = std.c.getenv("STALL_HOST") orelse return error.SkipZigTest;
+    const jobs = if (std.c.getenv("STALL_JOBS")) |j| try std.fmt.parseInt(usize, std.mem.span(j), 10) else 4;
+    const res, const conns, const took = try fetchPieces(&.{}, 3, 5000, 400, std.mem.span(host), jobs);
+    std.debug.print("many: done {d} failed {d}, {d} connections, {d} ms\n", .{ res.done, res.failed, conns, took });
+    try std.testing.expectEqual(@as(usize, 400), res.done);
+}
+
+// Every other thread's stack, for a hang on Windows where there is no debugger to ask.
+const win = std.os.windows;
+const THREADENTRY32 = extern struct { dwSize: u32, cntUsage: u32, th32ThreadID: u32, th32OwnerProcessID: u32, tpBasePri: i32, tpDeltaPri: i32, dwFlags: u32 };
+extern "kernel32" fn CreateToolhelp32Snapshot(flags: u32, pid: u32) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn Thread32First(h: win.HANDLE, e: *THREADENTRY32) callconv(.winapi) win.BOOL;
+extern "kernel32" fn Thread32Next(h: win.HANDLE, e: *THREADENTRY32) callconv(.winapi) win.BOOL;
+extern "kernel32" fn OpenThread(access: u32, inherit: win.BOOL, id: u32) callconv(.winapi) ?win.HANDLE;
+extern "kernel32" fn SuspendThread(h: win.HANDLE) callconv(.winapi) u32;
+extern "kernel32" fn GetThreadContext(h: win.HANDLE, c: *win.CONTEXT) callconv(.winapi) win.BOOL;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
+
+fn dumpThreads() void {
+    const snap = CreateToolhelp32Snapshot(4, 0);
+    var e: THREADENTRY32 = undefined;
+    e.dwSize = @sizeOf(THREADENTRY32);
+    const me = GetCurrentProcessId();
+    const self = GetCurrentThreadId();
+    var ok = Thread32First(snap, &e);
+    while (ok.toBool()) : (ok = Thread32Next(snap, &e)) {
+        if (e.th32OwnerProcessID != me or e.th32ThreadID == self) continue;
+        const h = OpenThread(0x1FFFFF, .FALSE, e.th32ThreadID) orelse continue;
+        _ = SuspendThread(h);
+        var ctx: win.CONTEXT align(16) = std.mem.zeroes(win.CONTEXT);
+        ctx.ContextFlags = 0x10000B; // CONTEXT_FULL
+        if (!GetThreadContext(h, &ctx).toBool()) continue;
+        var addrs: [48]usize = undefined;
+        var n: usize = 0;
+        while (n < addrs.len and ctx.Rip != 0) {
+            addrs[n] = ctx.Rip;
+            n += 1;
+            var base: usize = 0;
+            var history: win.UNWIND_HISTORY_TABLE = std.mem.zeroes(win.UNWIND_HISTORY_TABLE);
+            if (win.ntdll.RtlLookupFunctionEntry(ctx.Rip, &base, &history)) |fe| {
+                var handler: ?*anyopaque = null;
+                var frame: usize = 0;
+                _ = win.ntdll.RtlVirtualUnwind(0, base, ctx.Rip, fe, &ctx, &handler, &frame, null);
+            } else {
+                ctx.Rip = @as(*const usize, @ptrFromInt(ctx.Rsp)).*;
+                ctx.Rsp += 8;
+            }
+        }
+        const trace: std.debug.StackTrace = .{ .return_addresses = addrs[0..n], .skipped = .none };
+        const t = std.debug.lockStderr(&.{}).terminal();
+        defer std.debug.unlockStderr();
+        t.writer.print("\n--- thread {d}\n", .{e.th32ThreadID}) catch {};
+        std.debug.writeStackTrace(&trace, t) catch {};
+    }
 }

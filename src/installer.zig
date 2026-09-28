@@ -377,6 +377,12 @@ pub threadlocal var last_status: u16 = 0;
 
 /// GET a URL whole. `cookie` is the CDN access token, sent on every piece request.
 pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8) ![]u8 {
+    return fetchUrlWatched(gpa, client, url, cookie, null);
+}
+
+/// `fetchUrl`, with the connection handed to `watch` once it is open, so the watchdog can shut it
+/// down when the attempt runs past its deadline.
+fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, watch: ?*Watch) ![]u8 {
     // `Pragma: no-cache` is not the program's doing: the client opens every request with
     // INTERNET_FLAG_RELOAD, and that is what WinInet puts on the wire for it.
     const with_cookie = [_]std.http.Header{
@@ -394,6 +400,8 @@ pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u
         },
     });
     defer req.deinit();
+    if (watch) |w| if (req.connection) |c| w.attach(c.stream_reader.stream);
+    defer if (watch) |w| w.detach();
     try req.sendBodiless();
 
     var redirect_buffer: [8 * 1024]u8 = undefined;
@@ -402,12 +410,20 @@ pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u
         last_status = @intFromEnum(res.head.status);
         return error.HttpStatus;
     }
-    if (res.head.content_encoding != .identity) return error.UnsupportedCompressionMethod;
+    // The CDN compresses when asked, and the client asks by default; undone here as fetch does.
+    const decompress_buffer: []u8 = switch (res.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try gpa.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try gpa.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer gpa.free(decompress_buffer);
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     errdefer body.deinit();
     var transfer: [64]u8 = undefined;
-    _ = res.reader(&transfer).streamRemaining(&body.writer) catch |err| switch (err) {
+    var decompress: std.http.Decompress = undefined;
+    _ = res.readerDecompressing(&transfer, &decompress, decompress_buffer).streamRemaining(&body.writer) catch |err| switch (err) {
         error.ReadFailed => {
             if (res.bodyErr()) |e| return e;
             if (req.connection) |c| if (c.stream_reader.err) |e| return e;
@@ -592,39 +608,124 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
 /// A CDN connection can stay open and send nothing; without a limit the whole download waits on it forever.
 pub const piece_timeout_ms: u64 = 60_000;
 
-/// `fetchUrl`, abandoned (its request cancelled, the socket read interrupted) when it takes longer than
-/// `timeout_ms`: error.Timeout. `gpa` should be an arena: a body that completes as the timeout fires is not
-/// freed. Never runs a request without its deadline: when the two tasks cannot both be started, the
-/// attempt fails (error.ConcurrencyUnavailable) and the caller's retry takes it from there.
+/// A deadline for one request at a time, kept by a thread of its own. When the request runs past
+/// it, its connection is shut down, which ends a read that is waiting on a server that went quiet.
+///
+/// This deliberately uses no `std.Io` task, select or cancelation: on Windows, Zig 0.16's
+/// `Io.Threaded` can lose the wakeup of its internal parking mutex, and a worker waiting on a
+/// cancelled task then never returns (seen as one piece that never arrives). Every `Io` the fetch
+/// path uses is single-threaded, and the watchdog touches only the socket.
+pub const Watch = struct {
+    lock: std.atomic.Value(bool) = .init(false),
+    stream: ?std.Io.net.Stream = null,
+    /// Milliseconds on the `.awake` clock; 0 while no request is running.
+    deadline_ms: std.atomic.Value(i64) = .init(0),
+    expired: std.atomic.Value(bool) = .init(false),
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn acquire(w: *Watch) void {
+        while (w.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    fn release(w: *Watch) void {
+        w.lock.store(false, .release);
+    }
+
+    fn attach(w: *Watch, stream: std.Io.net.Stream) void {
+        w.acquire();
+        defer w.release();
+        w.stream = stream;
+    }
+    /// After this, the watchdog no longer touches the socket, so it may be closed or reused.
+    fn detach(w: *Watch) void {
+        w.acquire();
+        defer w.release();
+        w.stream = null;
+    }
+
+    fn begin(w: *Watch, io: std.Io, timeout_ms: u64) void {
+        w.expired.store(false, .release);
+        w.deadline_ms.store(nowMs(io) + @as(i64, @intCast(timeout_ms)), .release);
+    }
+    /// Whether the request ran past its deadline.
+    fn end(w: *Watch) bool {
+        w.deadline_ms.store(0, .release);
+        return w.expired.load(.acquire);
+    }
+
+    /// The watchdog: until `stop`, shut down the connection of a request past its deadline.
+    pub fn run(w: *Watch) void {
+        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+        defer threaded.deinit();
+        const io = threaded.io();
+        while (!w.stop.load(.acquire)) {
+            std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+            const d = w.deadline_ms.load(.acquire);
+            if (d == 0 or nowMs(io) < d or w.expired.load(.acquire)) continue;
+            w.expired.store(true, .release);
+            w.acquire();
+            defer w.release();
+            if (w.stream) |s| abortConnection(io, s);
+        }
+    }
+};
+
+/// End every read and write waiting on `s`. A POSIX shutdown does that; on Windows only an
+/// abortive disconnect does (a graceful one leaves a pending receive waiting), and closing the
+/// socket instead would complete the receive as cancelled, which Zig's reader treats as impossible.
+fn abortConnection(io: std.Io, s: std.Io.net.Stream) void {
+    if (@import("builtin").os.tag != .windows) {
+        s.shutdown(io, .both) catch {};
+        return;
+    }
+    const windows = std.os.windows;
+    const ev = CreateEventW(null, .TRUE, .FALSE, null) orelse return;
+    defer windows.CloseHandle(ev);
+    // Kept alive past a wait that times out: the driver may still write it.
+    const iosb = std.heap.page_allocator.create(windows.IO_STATUS_BLOCK) catch return;
+    var info: windows.AFD.PARTIAL_DISCONNECT_INFO = .{
+        .DisconnectMode = .{ .SEND = true, .RECEIVE = true, .ABORTIVE = true },
+        .Timeout = -1,
+    };
+    const st = windows.ntdll.NtDeviceIoControlFile(s.socket.handle, ev, null, null, iosb, windows.IOCTL.AFD.PARTIAL_DISCONNECT, &info, @sizeOf(@TypeOf(info)), null, 0);
+    if (st == .PENDING and WaitForSingleObject(ev, 5000) != 0) return; // leave `iosb` to the driver
+    std.heap.page_allocator.destroy(iosb);
+}
+
+extern "kernel32" fn CreateEventW(attrs: ?*anyopaque, manual: std.os.windows.BOOL, initial: std.os.windows.BOOL, name: ?[*:0]const u16) callconv(.winapi) ?std.os.windows.HANDLE;
+extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: u32) callconv(.winapi) u32;
+
+fn nowMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+}
+
+/// One request under `watch`'s deadline: error.Timeout once it runs past `timeout_ms`. A request
+/// still connecting when the deadline passes ends by the system's own connect and lookup timeouts.
+fn fetchAttempt(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, watch: *Watch, timeout_ms: u64) ![]u8 {
+    watch.begin(io, timeout_ms);
+    const got = fetchUrlWatched(gpa, client, url, cookie, watch);
+    if (watch.end()) {
+        if (got) |b| gpa.free(b) else |_| {}
+        return error.Timeout;
+    }
+    return got;
+}
+
+/// `fetchUrl`, abandoned when it takes longer than `timeout_ms`: error.Timeout. `client` must use an
+/// `Io` that runs nothing on other threads (`Io.Threaded` with no async or concurrent limit), see
+/// `Watch`.
 pub fn fetchWithin(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, timeout_ms: u64) ![]u8 {
-    const U = union(enum) {
-        body: anyerror![]u8,
-        timeout: std.Io.Cancelable!void,
-    };
-    var buf: [2]U = undefined;
-    var sel: std.Io.Select(U) = .init(io, &buf);
-    const Fetcher = struct {
-        fn run(g: std.mem.Allocator, c: *std.http.Client, u: []const u8, k: ?[]const u8) anyerror![]u8 {
-            return fetchUrl(g, c, u, k);
-        }
-        fn wait(i: std.Io, ms: u64) std.Io.Cancelable!void {
-            return std.Io.sleep(i, .fromMilliseconds(@intCast(ms)), .awake);
-        }
-    };
-    // The deadline first: if it cannot run, nothing has been sent yet.
-    try sel.concurrent(.timeout, Fetcher.wait, .{ io, timeout_ms });
-    sel.concurrent(.body, Fetcher.run, .{ gpa, client, url, cookie }) catch |e| {
-        _ = sel.cancel();
-        return e;
-    };
-    const first = try sel.await();
-    // The other one is cancelled and waited for; a body that finished anyway lives in `gpa` (the caller's
-    // per-piece arena), so it is simply dropped.
-    _ = sel.cancel();
-    return switch (first) {
-        .body => |b| b,
-        .timeout => error.Timeout,
-    };
+    var watch: Watch = .{};
+    const t = try std.Thread.spawn(.{}, Watch.run, .{&watch});
+    defer {
+        watch.stop.store(true, .release);
+        t.join();
+    }
+    return fetchAttempt(gpa, io, client, url, cookie, &watch, timeout_ms);
+}
+
+/// The `Io` a fetch worker uses: everything on the calling thread (see `Watch`).
+pub fn workerIo(threaded: *std.Io.Threaded) void {
+    threaded.* = .init(std.heap.page_allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
 }
 
 /// The shared state a set of fetch workers pulls from. The piece cursor is a fetch-and-add, so a
@@ -663,9 +764,17 @@ const Fetch = struct {
         // The client and the Io outlive every piece, so they must NOT come from the arena that
         // gets reset per piece - resetting it would pull their memory out from under them.
         const stable = std.heap.page_allocator;
-        var threaded: std.Io.Threaded = .init(stable, .{});
+        var threaded: std.Io.Threaded = undefined;
+        workerIo(&threaded);
         defer threaded.deinit();
         const io = threaded.io();
+
+        var watch: Watch = .{};
+        const watchdog = std.Thread.spawn(.{}, Watch.run, .{&watch}) catch null;
+        defer if (watchdog) |t| {
+            watch.stop.store(true, .release);
+            t.join();
+        };
 
         var client: std.http.Client = .{ .allocator = stable, .io = io };
         defer client.deinit();
@@ -705,7 +814,11 @@ const Fetch = struct {
                 // Each retry moves to the next server whose range covers this piece, so a
                 // mirror that is down costs one attempt rather than every attempt.
                 const url = f.meta.pieceUrlFrom(scratch, p, s, attempt) catch continue;
-                const body = fetchWithin(scratch, io, &client, url, f.cookie, f.timeout_ms) catch |e| {
+                // Without a watchdog there is no deadline, but the piece is still fetched.
+                const body = (if (watchdog != null)
+                    fetchAttempt(scratch, io, &client, url, f.cookie, &watch, f.timeout_ms)
+                else
+                    fetchUrl(scratch, &client, url, f.cookie)) catch |e| {
                     last_err = if (e == error.HttpStatus)
                         std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
                     else
