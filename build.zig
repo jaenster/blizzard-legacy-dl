@@ -76,6 +76,25 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(e2e).step);
 
+    // A server that goes silent mid-piece: the fetch must give up on time and retry, here and on Windows.
+    // With -Dtarget for another OS it installs zig-out/bin/stall-test(.exe) instead of running.
+    const stall = b.addTest(.{
+        .name = "stall-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stall_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "installer", .module = installer }, .{ .name = "legacy", .module = legacy } },
+            .link_libc = true,
+        }),
+        .filters = if (b.option([]const u8, "stall-filter", "Only the stall tests whose name contains this")) |f| b.dupeStrings(&.{f}) else &.{},
+    });
+    const stall_step = b.step("stall-test", "Fetch against a server that goes silent (installs the exe when cross-compiling)");
+    if (target.result.os.tag == b.graph.host.result.os.tag)
+        stall_step.dependOn(&b.addRunArtifact(stall).step)
+    else
+        stall_step.dependOn(&b.addInstallArtifact(stall, .{}).step);
+
     // A program embedding the "installer" module must build for Windows, whatever the host.
     const embed = b.addObject(.{
         .name = "installer-embed-check",

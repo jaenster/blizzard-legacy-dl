@@ -377,27 +377,44 @@ pub threadlocal var last_status: u16 = 0;
 
 /// GET a URL whole. `cookie` is the CDN access token, sent on every piece request.
 pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8) ![]u8 {
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    errdefer body.deinit();
     // `Pragma: no-cache` is not the program's doing: the client opens every request with
     // INTERNET_FLAG_RELOAD, and that is what WinInet puts on the wire for it.
     const with_cookie = [_]std.http.Header{
         .{ .name = "Pragma", .value = "no-cache" },
         .{ .name = "Cookie", .value = cookie orelse "" },
     };
-    const res = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
+    // Not `client.fetch`: when a body read fails for a reason of the socket's own (a cancelled read,
+    // a reset), fetch unwraps an HTTP-level error that was never set and panics. The request is
+    // driven here instead, and the socket's error is returned as it is.
+    var req = try client.request(.GET, try std.Uri.parse(url), .{
+        .redirect_behavior = @enumFromInt(3),
         .headers = .{ .user_agent = .{ .override = legacy.user_agent } },
         .extra_headers = if (cookie != null) &with_cookie else &.{
             .{ .name = "Pragma", .value = "no-cache" },
         },
-        .response_writer = &body.writer,
     });
-    if (res.status != .ok and res.status != .partial_content) {
-        last_status = @intFromEnum(res.status);
+    defer req.deinit();
+    try req.sendBodiless();
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var res = try req.receiveHead(&redirect_buffer);
+    if (res.head.status != .ok and res.head.status != .partial_content) {
+        last_status = @intFromEnum(res.head.status);
         return error.HttpStatus;
     }
+    if (res.head.content_encoding != .identity) return error.UnsupportedCompressionMethod;
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    errdefer body.deinit();
+    var transfer: [64]u8 = undefined;
+    _ = res.reader(&transfer).streamRemaining(&body.writer) catch |err| switch (err) {
+        error.ReadFailed => {
+            if (res.bodyErr()) |e| return e;
+            if (req.connection) |c| if (c.stream_reader.err) |e| return e;
+            return error.ReadFailed;
+        },
+        error.WriteFailed => return error.OutOfMemory,
+    };
     return body.toOwnedSlice();
 }
 
@@ -487,6 +504,8 @@ pub const FetchOptions = struct {
     control: ?*Control = null,
     /// How the destination is named in the closing message.
     label: []const u8 = "",
+    /// How long one piece's request may take before it is abandoned and tried again.
+    piece_timeout_ms: u64 = piece_timeout_ms,
 };
 
 pub const FetchResult = struct {
@@ -532,6 +551,7 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
         .control = opts.control,
         .rep = rep,
         .total = total,
+        .timeout_ms = opts.piece_timeout_ms,
     };
     {
         rep.acquire();
@@ -574,7 +594,8 @@ pub const piece_timeout_ms: u64 = 60_000;
 
 /// `fetchUrl`, abandoned (its request cancelled, the socket read interrupted) when it takes longer than
 /// `timeout_ms`: error.Timeout. `gpa` should be an arena: a body that completes as the timeout fires is not
-/// freed.
+/// freed. Never runs a request without its deadline: when the two tasks cannot both be started, the
+/// attempt fails (error.ConcurrencyUnavailable) and the caller's retry takes it from there.
 pub fn fetchWithin(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, timeout_ms: u64) ![]u8 {
     const U = union(enum) {
         body: anyerror![]u8,
@@ -590,11 +611,11 @@ pub fn fetchWithin(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client,
             return std.Io.sleep(i, .fromMilliseconds(@intCast(ms)), .awake);
         }
     };
-    // No unit of concurrency to spare: fetch without a limit rather than not at all.
-    sel.concurrent(.body, Fetcher.run, .{ gpa, client, url, cookie }) catch return fetchUrl(gpa, client, url, cookie);
-    sel.concurrent(.timeout, Fetcher.wait, .{ io, timeout_ms }) catch {
-        const only = try sel.await();
-        return only.body;
+    // The deadline first: if it cannot run, nothing has been sent yet.
+    try sel.concurrent(.timeout, Fetcher.wait, .{ io, timeout_ms });
+    sel.concurrent(.body, Fetcher.run, .{ gpa, client, url, cookie }) catch |e| {
+        _ = sel.cancel();
+        return e;
     };
     const first = try sel.await();
     // The other one is cancelled and waited for; a body that finished anyway lives in `gpa` (the caller's
@@ -620,6 +641,7 @@ const Fetch = struct {
     control: ?*Control,
     rep: *Reporter,
     total: u64,
+    timeout_ms: u64,
 
     cursor: usize = 0,
     done: usize = 0,
@@ -683,7 +705,7 @@ const Fetch = struct {
                 // Each retry moves to the next server whose range covers this piece, so a
                 // mirror that is down costs one attempt rather than every attempt.
                 const url = f.meta.pieceUrlFrom(scratch, p, s, attempt) catch continue;
-                const body = fetchWithin(scratch, io, &client, url, f.cookie, piece_timeout_ms) catch |e| {
+                const body = fetchWithin(scratch, io, &client, url, f.cookie, f.timeout_ms) catch |e| {
                     last_err = if (e == error.HttpStatus)
                         std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
                     else
@@ -692,6 +714,8 @@ const Fetch = struct {
                         // A connection that went quiet: drop every pooled connection, so the retry dials anew.
                         client.deinit();
                         client = .{ .allocator = stable, .io = io };
+                        if (attempt < f.retries)
+                            f.rep.say(.downloading, "\n  piece {d}: no answer for {d} s, trying again on a new connection\n", .{ p, f.timeout_ms / 1000 });
                     }
                     // A little longer between tries each time.
                     std.Io.sleep(io, .fromMilliseconds(@intCast(250 * (attempt + 1))), .awake) catch {};
