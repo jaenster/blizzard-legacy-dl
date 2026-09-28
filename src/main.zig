@@ -6,12 +6,15 @@
 
 const std = @import("std");
 const legacy = @import("legacy");
+const installer = @import("installer.zig");
 const proxy = @import("proxy.zig");
-const mpq = @import("libd2").formats.mpq;
-const script = @import("libd2").formats.installer;
-const ptc = @import("libd2").formats.ptc;
-const keystore = @import("libd2").bnet.keystore;
 const cdkey = @import("libd2").bnet.cdkey;
+
+const fetchUrl = installer.fetchUrl;
+const mkdirs = installer.mkdirs;
+const zpath = installer.zpath;
+const createFile = installer.createFile;
+const readFile = installer.readFile;
 
 const usage =
     \\blizzard-legacy-dl — read a Blizzard legacy downloader stub and fetch its payload
@@ -65,89 +68,13 @@ const usage =
     \\
 ;
 
-/// Blizzard's own endpoint. `www.battle.net` bounces through `eu.battle.net` to get here, so go
-/// straight to it. It rate-limits: back-to-back requests come back empty, which looks exactly
-/// like a missing product until you slow down.
-const getlegacy = "https://downloader.battle.net/download/getLegacy";
+const getlegacy = installer.getlegacy;
 
 const products = [_][]const u8{ "D2DV", "D2XP", "STAR", "WAR3", "W3XP" };
 const locales = [_][]const u8{
     "en-US", "en-GB", "de-DE", "es-ES", "es-MX", "fr-FR", "it-IT",
     "ja-JP", "ko-KR", "pl-PL", "pt-BR", "ru-RU", "zh-CN", "zh-TW",
 };
-
-// Files go through `std.Io`: the POSIX calls this used before have no Windows counterpart,
-// and the payload being a Windows installer makes that the one platform to support.
-const File = std.Io.File;
-const Dir = std.Io.Dir;
-
-// Paths arrive both relative and absolute, and `Dir` splits those into different calls.
-fn openFile(io: std.Io, path: []const u8, mode: Dir.OpenFileOptions.Mode) !File {
-    return if (std.fs.path.isAbsolute(path))
-        Dir.openFileAbsolute(io, path, .{ .mode = mode })
-    else
-        Dir.cwd().openFile(io, path, .{ .mode = mode });
-}
-
-fn createFile(io: std.Io, path: []const u8) !File {
-    // `truncate = false` because the caller may be resuming into a file it preallocated on an
-    // earlier run, and throwing those bytes away would restart the download.
-    return if (std.fs.path.isAbsolute(path))
-        Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = false })
-    else
-        Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
-}
-
-fn zpath(gpa: std.mem.Allocator, parts: []const []const u8) ![:0]u8 {
-    var b: std.ArrayList(u8) = .empty;
-    for (parts, 0..) |p, i| {
-        if (i != 0 and b.items.len != 0) try b.append(gpa, '/');
-        try b.appendSlice(gpa, p);
-    }
-    return b.toOwnedSliceSentinel(gpa, 0);
-}
-
-/// Where payloads live when nobody says otherwise. A payload for a given product and locale never
-/// changes, so every install of every version can share one copy.
-fn cacheDir(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ![]const u8 {
-    const base = env.get("BLIZZARD_LEGACY_DL_CACHE") orelse
-        env.get("XDG_CACHE_HOME") orelse
-        env.get("LOCALAPPDATA") orelse
-        if (env.get("HOME")) |home|
-            try std.fmt.allocPrint(gpa, "{s}/.cache", .{home})
-        else
-            return ".";
-    const dir = try std.fmt.allocPrint(gpa, "{s}/blizzard-legacy-dl", .{base});
-    mkdirs(io, dir) catch return ".";
-    return dir;
-}
-
-/// Create every directory on the way to `path`, ignoring the ones already there.
-fn mkdirs(io: std.Io, path: []const u8) !void {
-    if (std.fs.path.isAbsolute(path)) {
-        var root = try Dir.openDirAbsolute(io, "/", .{});
-        defer root.close(io);
-        try root.createDirPath(io, path[1..]);
-    } else {
-        try Dir.cwd().createDirPath(io, path);
-    }
-}
-
-fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    const f = try openFile(io, path, .read_only);
-    defer f.close(io);
-    const len = try f.length(io);
-    const buf = try gpa.alloc(u8, @intCast(len));
-    _ = try f.readPositionalAll(io, buf, 0);
-    return buf;
-}
-
-fn writeWhole(io: std.Io, path: []const u8, data: []const u8) !void {
-    const f = try createFile(io, path);
-    defer f.close(io);
-    try f.writePositionalAll(io, data, 0);
-    try f.setLength(io, data.len);
-}
 
 fn human(n: u64, buf: []u8) []const u8 {
     const units = [_][]const u8{ "B", "KB", "MB", "GB" };
@@ -189,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
     var patch_source: []const u8 = "https://files.typeguru.nl/diablo/patches/pc";
     var platform: []const u8 = "win32";
     var language: []const u8 = "English";
-    var secrets: Secrets = .{};
+    var secrets: installer.Secrets = .{};
     var i: usize = 3;
     if (argv.len > 3 and argv[3].len != 0 and (std.ascii.isDigit(argv[3][0]))) {
         want_version = argv[3];
@@ -298,7 +225,7 @@ pub fn main(init: std.process.Init) !void {
         var got: usize = 0;
         for (products) |p| for ([_][]const u8{ "WIN", "MAC" }) |o| for (locales) |l| {
             const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{ getlegacy, p, l, o });
-            const body = fetchUrl(gpa, &client, url) catch continue;
+            const body = fetchUrl(gpa, &client, url, null) catch continue;
             if (body.len < 1024) continue; // an empty reply is the rate limiter, not a 404
             const ext: []const u8 = if (std.mem.eql(u8, o, "MAC")) "zip" else "exe";
             const name = try std.fmt.allocPrint(gpa, "{s}_{s}_{s}.{s}", .{ p, l, o, ext });
@@ -318,7 +245,41 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(usage, .{});
         return error.Usage;
     }
-    const stub = try resolveStub(gpa, init.io, &client, argv[2], locale, os_);
+
+    var term: Term = .{ .gpa = gpa, .io = init.io, .tty = std.Io.File.stderr().isTty(init.io) catch false };
+    const progress: installer.Progress = .{ .ctx = &term, .report = Term.report };
+    term.rep = .init(progress);
+
+    // The payload is scratch on the way to a game directory, and running the command from
+    // somewhere else should not mean fetching the same immutable gigabyte and a half again, so
+    // install keeps payloads in a cache every install shares. An expansion installs over its base
+    // game, so asking for one installs both, base first.
+    if (std.mem.eql(u8, verb, "install")) {
+        return installer.install(std.heap.smp_allocator, init.io, .{
+            .product = argv[2],
+            .version = want_version,
+            .game_dir = game_dir orelse "",
+            .cache_dir = out_dir,
+            .locale = locale,
+            .os = os_,
+            .jobs = @intCast(@min(jobs, 255)),
+            .patch_source = patch_source,
+            .progress = progress,
+            .secrets = secrets,
+            .no_base = no_base,
+            .platform = if (std.mem.eql(u8, platform, "macos")) .macos else .win32,
+            .language = language,
+            .base_url = base,
+            .cookie = cookie_override,
+            .retries = retries,
+            .sequential = sequential,
+            .first_piece = from,
+            .last_piece = to,
+        });
+    }
+
+    var cookie: ?[]const u8 = null;
+    const stub = try installer.resolveStub(gpa, init.io, &client, argv[2], locale, os_, &term.rep);
     var meta = try legacy.fromStub(gpa, stub);
 
     // The pieces are numbered files under one base, so any host laid out the same way serves
@@ -385,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
                 std.mem.trimEnd(u8, host, "/"),
             });
             std.debug.print("4  server config {s}\n", .{url});
-            if (fetchUrl(gpa, &client, url)) |body| {
+            if (fetchUrl(gpa, &client, url, cookie)) |body| {
                 std.debug.print("     {d} bytes\n", .{body.len});
             } else |e| {
                 std.debug.print("     no answer ({t}) — the client ignores this too\n", .{e});
@@ -410,7 +371,7 @@ pub fn main(init: std.process.Init) !void {
             const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
             const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .started);
             std.debug.print("6  tracker       {s}\n", .{url});
-            if (fetchUrl(gpa, &client, url)) |body| {
+            if (fetchUrl(gpa, &client, url, cookie)) |body| {
                 const r = try legacy.parseAnnounce(gpa, body);
                 if (r.failure) |f| {
                     std.debug.print("     refused: {s}\n", .{f});
@@ -480,447 +441,63 @@ pub fn main(init: std.process.Init) !void {
 
     // The payload gets its own directory named after the torrent, so the cwd is a fine default
     // and saves typing -o . every time.
-    //
-    // Not for `install`, though: there the payload is scratch on the way to a game directory, and
-    // running the command from somewhere else should not mean fetching the same immutable gigabyte
-    // and a half again. Those go to a cache, which every install shares.
-    const dir_path = out_dir orelse if (std.mem.eql(u8, verb, "install")) try cacheDir(gpa, init.io, init.environ_map) else ".";
+    const dir_path = out_dir orelse ".";
+    const last = to orelse meta.pieceCount() - 1;
 
-    // An expansion installs over its base game, so asking to install one means installing both,
-    // base first. Only `install` does this: fetching an expansion on its own is a fine thing to
-    // want, and `run` walks one payload by definition.
-    var code_buf: [8]u8 = undefined;
-    const code = if (argv[2].len <= code_buf.len) blk: {
-        for (argv[2], 0..) |c, k| code_buf[k] = std.ascii.toUpper(c);
-        break :blk code_buf[0..argv[2].len];
-    } else argv[2];
-    const both = std.mem.eql(u8, verb, "install") and !no_base;
-    const targets: []const []const u8 =
-        if (both and std.mem.eql(u8, code, "D2XP")) &.{ "D2DV", "D2XP" } else if (both and std.mem.eql(u8, code, "W3XP")) &.{ "WAR3", "W3XP" } else &.{argv[2]};
+    // The payload's own top-level directory, so an assembled tree matches what the stub expects
+    // to launch.
+    const dest = try zpath(gpa, &.{ dir_path, meta.name });
+    try installer.preallocate(gpa, init.io, meta, dest);
 
-    // Both halves land in one game directory, named for what was actually asked for.
-    const game_root = game_dir orelse try std.fmt.allocPrint(gpa, "{s}/{s}-game", .{ dir_path, meta.name });
-
-    for (targets, 0..) |target, pass| {
-        // Resolve every target, not just the ones that differ by name: the base pass overwrites
-        // `meta`, so the expansion pass cannot reuse what was resolved before the loop.
-        if (targets.len > 1) {
-            std.debug.print("\n=== {s} ===\n", .{target});
-            const base_stub = try resolveStub(gpa, init.io, &client, target, locale, os_);
-            meta = try legacy.fromStub(gpa, base_stub);
-            if (meta.token) |t| cookie = t;
-            if (cookie_override) |c| cookie = c;
-        }
-        const last = to orelse meta.pieceCount() - 1;
-
-        // The payload's own top-level directory, so an assembled tree matches what the stub expects
-        // to launch.
-        const dest = try zpath(gpa, &.{ dir_path, meta.name });
-        try mkdirs(init.io, dest);
-
-        // Preallocate every file at full length once, so a piece can be written wherever it lands
-        // without caring whether the bytes around it have arrived yet.
-        for (meta.files) |f| {
-            const full = try zpath(gpa, &.{ dest, f.path });
-            if (std.mem.lastIndexOfScalar(u8, full, '/')) |at| try mkdirs(init.io, full[0..at]);
-            const fh = try createFile(init.io, full);
-            defer fh.close(init.io);
-            try fh.setLength(init.io, f.length);
-        }
-
-        if (std.mem.eql(u8, verb, "verify")) {
-            var bad: usize = 0;
-            var buf = try gpa.alloc(u8, meta.piece_length);
-            var p = from;
-            while (p <= last) : (p += 1) {
-                const want = meta.pieceSize(p);
-                const got = readPiece(meta, gpa, init.io, dest, p, buf[0..want]) catch "";
-                meta.verify(p, got) catch {
-                    bad += 1;
-                    std.debug.print("  piece {d}: BAD\n", .{p});
-                };
-            }
-            std.debug.print("{d} pieces checked, {d} bad\n", .{ last - from + 1, bad });
-            return if (bad == 0) {} else error.Corrupt;
-        }
-
-        if (!std.mem.eql(u8, verb, "fetch") and !std.mem.eql(u8, verb, "run") and
-            !std.mem.eql(u8, verb, "install"))
-        {
-            std.debug.print("{s}", .{usage});
-            return error.Usage;
-        }
-
-        var done: usize = 0;
-        var failed: usize = 0;
-        var resumed: usize = 0;
-
-        // Pieces are fetched in a random order rather than 0,1,2,... — that is what the CDN
-        // expects to see, and it spreads a resumed download instead of replaying one region.
-        const order = try gpa.alloc(usize, last - from + 1);
-        for (order, 0..) |*o, k| o.* = from + k;
-        if (!sequential) {
-            // Seeded from the clock, the same way the client seeds the rand() behind its shuffle,
-            // so consecutive runs do not repeat an order.
-            const now = std.Io.Timestamp.now(init.io, .real);
-            var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(now.nanoseconds))));
-            prng.random().shuffle(usize, order);
-        }
-
-        // Each piece allocates a body, a URL and a span list. Without a reset they accumulate to
-        // the size of the payload, which for these is well over a gigabyte.
-        var scratch_state = std.heap.ArenaAllocator.init(gpa);
-        defer scratch_state.deinit();
-
-        // The map only makes sense on a terminal; piped or in CI it would be a wall of escapes.
-        const tty = (std.Io.File.stderr().isTty(init.io) catch false);
-        var grid: ?Grid = if (tty) try Grid.init(gpa, init.io, last - from + 1) else null;
-
-        // Several pieces at once. The real client does the same, governed by its maxpending and
-        // maxsimultaneous settings; neither it nor this caps the download rate itself.
-        var shared: Fetch = .{
-            .meta = meta,
-            .order = order,
-            .from = from,
-            .last = last,
-            .dest = dest,
-            .retries = retries,
-            .grid = if (grid) |*g| g else null,
-        };
-
-        {
-            const workers = try gpa.alloc(std.Thread, jobs);
-            defer gpa.free(workers);
-            var spawned: usize = 0;
-            for (workers) |*t| {
-                t.* = std.Thread.spawn(.{}, Fetch.work, .{&shared}) catch break;
-                spawned += 1;
-            }
-            // If no thread could start, do the work here rather than silently finishing early.
-            if (spawned == 0) Fetch.work(&shared) else for (workers[0..spawned]) |t| t.join();
-        }
-
-        done = shared.done;
-        failed = shared.failed;
-        resumed = shared.resumed;
-        if (shared.gave_up) {
-            if (grid) |*g| g.draw(done, failed, true);
-            std.debug.print("\n{d} pieces failed and none succeeded.\n" ++
-                "A 403 here usually means the stub's access token has expired; fetch a fresh\n" ++
-                "stub by asking for the product code, or pass --cookie. See the README.\n", .{failed});
-            return error.AllPiecesFailed;
-        }
-
-        if (grid) |*g| g.draw(done, failed, true);
-        if (resumed != 0)
-            std.debug.print("\n{d} pieces written, {d} already had, {d} failed -> {s}/{s}\n", .{ done - resumed, resumed, failed, dir_path, meta.name })
-        else
-            std.debug.print("\n{d} pieces written, {d} failed -> {s}/{s}\n", .{ done, failed, dir_path, meta.name });
-
-        if (std.mem.eql(u8, verb, "run")) {
-            // The client announces exactly twice, started and stopped, and the second one claims
-            // the download finished whether it did or not.
-            if (!no_tracker and meta.announce.len != 0) {
-                const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
-                const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .stopped);
-                std.debug.print("8  tracker       event=stopped\n", .{});
-                if (fetchUrl(gpa, &client, url)) |_| {} else |_| {}
-            } else {
-                std.debug.print("8  tracker       skipped\n", .{});
-            }
-            // The client would run this itself. Printing it is as far as this goes: fetching a
-            // payload is one thing, executing it unasked is another.
-            std.debug.print("9  launch target {s}/{s}  (not run)\n", .{ dir_path, meta.launch_target });
-        }
-
-        if (failed != 0) return error.Incomplete;
-
-        if (std.mem.eql(u8, verb, "install")) try install(gpa, init.io, dest, game_root, platform, language, if (pass + 1 == targets.len) want_version else null, patch_source, secrets, &client);
-    } // end of the per-product loop
-}
-
-/// The archives an install lays down, in the order the game searches them. `patch_d2.mpq` is not
-/// among them: the patch rebuilds that one outright.
-const installed_archives = [_][]const u8{
-    "d2exp.mpq",  "d2xtalk.mpq", "d2xmusic.mpq", "d2xvideo.mpq", "d2data.mpq",
-    "d2char.mpq", "d2sfx.mpq",   "d2music.mpq",  "d2speech.mpq", "d2video.mpq",
-};
-
-/// Take a game directory back to an older version, the way Blizzard's patch installer does.
-///
-/// The payload carries the original build of each product — 1.00 for the base game, 1.07 for the
-/// expansion — under `PC-100`/`PC-100x`. Patches are cumulative ("upgrades from version 1.00 or
-/// later", as the 1.09 script puts it), so one archive gets from that base to any later version.
-///
-/// Two tables drive it. One maps members to files on disk; the other, `patch.lst`, maps members
-/// into `patch_d2.mpq`, which the script deletes and rebuilds outright rather than adding to.
-fn patchTo(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    client: *std.http.Client,
-    set: *const mpq.Set,
-    game: []const u8,
-    version: []const u8,
-    expansion: bool,
-    source: []const u8,
-) !void {
-    // Version strings are written 1.09b but the archives are named 109b.
-    var tidy: std.ArrayList(u8) = .empty;
-    for (version) |c| if (c != '.') try tidy.append(gpa, c);
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}Patch_{s}.exe", .{
-        source, if (expansion) "LOD" else "D2", tidy.items,
-    });
-    std.debug.print("\npatching to {s}\n  {s}\n", .{ version, url });
-
-    const exe = fetchUrl(gpa, client, url) catch |e| {
-        std.debug.print("  no patch archive for {s} ({t})\n", .{ version, e });
-        return error.NoSuchVersion;
-    };
-    var patch = try mpq.Archive.open(gpa, exe);
-    defer patch.deinit(gpa);
-
-    // The base to patch, straight out of the payload.
-    const prefix = if (expansion) "PC-100x\\" else "PC-100\\";
-    var base: std.StringHashMapUnmanaged([]const u8) = .empty;
-
-    // The disk map has no fixed name, so it is found by shape: the only member that is text and
-    // pairs members with $(InstallPath) destinations.
-    var disk_map: ?[]const u8 = null;
-    for (0..patch.blocks.len) |i| {
-        const idx: u32 = @intCast(i);
-        const key = patch.recoverKey(gpa, idx) catch null;
-        const data = patch.readBlock(gpa, idx, key) catch continue;
-        if (data.len > 8192 or data.len < 16) continue;
-        if (std.mem.indexOf(u8, data, ";$(InstallPath)") != null) {
-            disk_map = data;
-            break;
-        }
-    }
-
-    var wrote: usize = 0;
-    var unchanged: usize = 0;
-    if (disk_map) |text| {
-        for (try ptc.parseMap(gpa, text)) |m| {
-            // A file the patch does not carry is one it does not change; the installed copy stays.
-            const rec_bytes = patch.read(gpa, m.member) catch {
-                unchanged += 1;
-                continue;
+    if (std.mem.eql(u8, verb, "verify")) {
+        var bad: usize = 0;
+        var buf = try gpa.alloc(u8, meta.piece_length);
+        var p = from;
+        while (p <= last) : (p += 1) {
+            const want = meta.pieceSize(p);
+            const got = installer.readPiece(meta, gpa, init.io, dest, p, buf[0..want]) catch "";
+            meta.verify(p, got) catch {
+                bad += 1;
+                std.debug.print("  piece {d}: BAD\n", .{p});
             };
-            const rec = ptc.Record.parse(rec_bytes) catch continue;
-            const name = m.basename();
-
-            // The source is the original build for this product, not what is on disk.
-            const src = base.get(name) orelse blk: {
-                const member = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, name });
-                const b = set.read(gpa, member) catch &[_]u8{};
-                try base.put(gpa, name, b);
-                break :blk b;
-            };
-            const out = ptc.apply(gpa, rec, src) catch |e| {
-                std.debug.print("  refused {s}: {t}\n", .{ name, e });
-                continue;
-            };
-            const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, name });
-            try writeWhole(io, full, out);
-            wrote += 1;
         }
+        std.debug.print("{d} pieces checked, {d} bad\n", .{ last - from + 1, bad });
+        return if (bad == 0) {} else error.Corrupt;
     }
 
-    // patch_d2.mpq is rebuilt from nothing, exactly as the script asks.
-    var rebuilt: usize = 0;
-    var short: usize = 0;
-    if (patch.read(gpa, "patch.lst")) |lst| {
-        // Here the pair is the other way round: archive path first, member second.
-        const Wanted = struct { name: []const u8, rec: ptc.Record, data: ?[]const u8 };
-        var want: std.ArrayList(Wanted) = .empty;
-        var deltas: usize = 0;
-        for (try ptc.parseMap(gpa, lst)) |m| {
-            const bytes = patch.read(gpa, m.destination) catch continue;
-            const rec = ptc.Record.parse(bytes) catch continue;
-            if (rec.src_size == 0) {
-                const body = ptc.apply(gpa, rec, &[_]u8{}) catch continue;
-                try want.append(gpa, .{ .name = m.member, .rec = rec, .data = body });
-            } else {
-                deltas += 1;
-                try want.append(gpa, .{ .name = m.member, .rec = rec, .data = null });
-            }
-        }
-
-        // Most members of patch_d2.mpq are deltas against the file the game reads today, so the
-        // source comes out of the installed archives — `data\global\excel\armor.bin` against the
-        // copy in d2exp.mpq, and so on. They are searched in the game's own order, one at a time so
-        // that a quarter-gigabyte archive is never held for longer than it is being read, and
-        // patch_d2.mpq is not among them: the script deletes it before any of this.
-        for (installed_archives) |archive_name| {
-            if (deltas == 0) break;
-            const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
-            defer gpa.free(path);
-            const bytes = readFile(gpa, io, path) catch continue;
-            defer gpa.free(bytes);
-            var have = mpq.Archive.open(gpa, bytes) catch continue;
-            defer have.deinit(gpa);
-            for (want.items) |*w| {
-                if (w.data != null) continue;
-                const src = have.read(gpa, w.name) catch continue;
-                defer gpa.free(src);
-                w.data = ptc.apply(gpa, w.rec, src) catch continue;
-                deltas -= 1;
-            }
-        }
-
-        var members: std.ArrayList(mpq.NewFile) = .empty;
-        for (want.items) |w| {
-            if (w.data) |d| try members.append(gpa, .{ .name = w.name, .data = d }) else short += 1;
-        }
-        if (members.items.len != 0) {
-            // Give it a `(listfile)`, which Blizzard's own patch_d2.mpq does not have. An archive
-            // stores hashes rather than names, so one without a listfile cannot be enumerated at
-            // all — and a tool that reduces an archive by walking its names silently produces an
-            // EMPTY one instead of failing. We know every name here; writing them down costs a few
-            // kilobytes and removes that whole class of quiet damage.
-            var listing: std.Io.Writer.Allocating = .init(gpa);
-            for (members.items) |m| {
-                try listing.writer.writeAll(m.name);
-                try listing.writer.writeAll("\r\n");
-            }
-            try members.append(gpa, .{ .name = "(listfile)", .data = listing.written() });
-
-            var slots: u32 = 16;
-            while (slots < members.items.len * 2) slots *= 2;
-            const empty = try mpq.empty(gpa, slots);
-            const built = try mpq.append(gpa, empty, members.items);
-            const full = try std.fmt.allocPrint(gpa, "{s}/patch_d2.mpq", .{game});
-            try writeWhole(io, full, built);
-            rebuilt = members.items.len - 1; // the listfile is ours, not one of the patch's members
-        }
-    } else |_| {}
-
-    std.debug.print("  {d} files patched, {d} left as installed, patch_d2.mpq rebuilt with {d} members\n", .{ wrote, unchanged, rebuilt });
-    if (short != 0) std.debug.print("  {d} members of patch_d2.mpq could not be rebuilt\n", .{short});
-
-    // Only a version that ships its own Storm.dll reads the archives through it; 1.14 links its
-    // archive code into Game.exe and reads everything the payload carries.
-    if (fileExists(io, game, "Storm.dll")) {
-        for (installed_archives) |archive_name| {
-            const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
-            defer gpa.free(path);
-            const bytes = readFile(gpa, io, path) catch continue;
-            defer gpa.free(bytes);
-            if (!try unhookModernAttributes(gpa, bytes)) continue;
-            try writeWhole(io, path, bytes);
-            std.debug.print("  {s}: unlisted its (attributes), which this version's Storm.dll cannot read\n", .{archive_name});
-        }
+    if (!std.mem.eql(u8, verb, "fetch") and !std.mem.eql(u8, verb, "run")) {
+        std.debug.print("{s}", .{usage});
+        return error.Usage;
     }
+
+    const got = try installer.fetchPayload(gpa, init.io, meta, dest, .{
+        .first = from,
+        .last = last,
+        .retries = retries,
+        .jobs = jobs,
+        .sequential = sequential,
+        .cookie = cookie,
+        .label = dir_path,
+    }, &term.rep);
+
+    if (std.mem.eql(u8, verb, "run")) {
+        // The client announces exactly twice, started and stopped, and the second one claims
+        // the download finished whether it did or not.
+        if (!no_tracker and meta.announce.len != 0) {
+            const pid = legacy.peerId(@bitCast(@as(i64, @intCast(meta.total))));
+            const url = try legacy.announceUrl(gpa, meta.announce, meta.infohash, pid, "0", .stopped);
+            std.debug.print("8  tracker       event=stopped\n", .{});
+            if (fetchUrl(gpa, &client, url, cookie)) |_| {} else |_| {}
+        } else {
+            std.debug.print("8  tracker       skipped\n", .{});
+        }
+        // The client would run this itself. Printing it is as far as this goes: fetching a
+        // payload is one thing, executing it unasked is another.
+        std.debug.print("9  launch target {s}/{s}  (not run)\n", .{ dir_path, meta.launch_target });
+    }
+
+    if (got.failed != 0) return error.Incomplete;
 }
-
-fn fileExists(io: std.Io, dir: []const u8, name: []const u8) bool {
-    var buf: [512]u8 = undefined;
-    const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return false;
-    const f = openFile(io, full, .read_only) catch return false;
-    f.close(io);
-    return true;
-}
-
-/// What an `(attributes)` member may carry for the Storm.dll a pre-1.14 version ships: a CRC32 and
-/// a FILETIME per block. Its loader sizes the member as 8 + 12 bytes a block and ignores
-/// anything else.
-const storm_dll_attributes: u32 = 0x1 | 0x2;
-
-/// A hash-table slot whose member is gone. Unlike an empty slot, a lookup probes past it, so the
-/// names that collided behind it stay reachable.
-const deleted_slot: u32 = 0xFFFF_FFFE;
-
-/// Take a 1.14-format `(attributes)` out of an archive's hash table, in place. True if there was
-/// one to take.
-///
-/// Every older version is built from the 1.14b payload, and of the archives it carries only
-/// `d2sfx.mpq` has its `(attributes)` in the 1.14 format: zlib-compressed with per-sector CRCs, and
-/// carrying an MD5 per block besides. Its listfile is zlib too, but nothing reads that at startup. Storm.dll opens
-/// `(attributes)` inside `SFileOpenArchive`, and the Storm.dll 1.13c ships decompresses Huffman,
-/// PKWARE and the two ADPCM codecs and nothing else. A zlib sector falls through to Storm's fatal
-/// error 0x85100083, reported against the archive:
-///
-///     This application has encountered a critical error: The file data is corrupt.
-///     File: d2sfx.mpq
-///
-/// That reads as a damaged download, or as a missing CD key, and is neither. It is also not about
-/// reading `(attributes)` too strictly: the same member would be discarded a moment later anyway,
-/// because with the MD5 column it is not the 8 + 12-per-block size that loader accepts. So the
-/// member is worth nothing to that engine, and only having it listed kills the boot.
-///
-/// The test is on the content rather than on the archive's name, so a `(attributes)` the old
-/// Storm can use — the ones in `d2exp.mpq` and the other expansion archives, which carry only the
-/// CRC32 and FILETIME columns — keeps its checksums. Only the hash entry changes; the bytes
-/// stay where they are, unreferenced, and the archive keeps its size and every member its offset.
-fn unhookModernAttributes(gpa: std.mem.Allocator, bytes: []u8) !bool {
-    var arc = mpq.Archive.open(gpa, bytes) catch return false;
-    defer arc.deinit(gpa);
-
-    const attrs = arc.read(gpa, "(attributes)") catch return false;
-    defer gpa.free(attrs);
-    if (attrs.len < 8) return false;
-    const carries = std.mem.readInt(u32, attrs[4..8], .little);
-    if (carries & ~storm_dll_attributes == 0) return false;
-
-    const mask: u32 = @intCast(arc.hashes.len - 1);
-    const a = mpq.hashString("(attributes)", .name_a);
-    const b = mpq.hashString("(attributes)", .name_b);
-    var slot = mpq.hashString("(attributes)", .table_offset) & mask;
-    var probes: u32 = 0;
-    const found = while (probes <= mask) : (probes += 1) {
-        const e = arc.hashes[slot];
-        if (e.block_index == 0xFFFF_FFFF) return false;
-        if (e.block_index != deleted_slot and e.name_a == a and e.name_b == b) break slot;
-        slot = (slot + 1) & mask;
-    } else return false;
-    arc.hashes[found].block_index = deleted_slot;
-
-    const table = bytes[arc.base + arc.header.hash_table_pos ..][0 .. arc.hashes.len * 16];
-    for (arc.hashes, 0..) |e, i| {
-        const r = table[i * 16 ..][0..16];
-        std.mem.writeInt(u32, r[0..4], e.name_a, .little);
-        std.mem.writeInt(u32, r[4..8], e.name_b, .little);
-        std.mem.writeInt(u16, r[8..10], e.locale, .little);
-        std.mem.writeInt(u16, r[10..12], e.platform, .little);
-        std.mem.writeInt(u32, r[12..16], e.block_index, .little);
-    }
-    mpq.encrypt(table, mpq.hashString("(hash table)", .file_key));
-    return true;
-}
-
-/// Build the game directory from a payload that has just been fetched.
-///
-/// The payload's archives hold both the files and the script saying where they go. Everything the
-/// script asks for that has meaning off Windows is done; the registry keys, shortcuts and DirectX
-/// bundle it also asks for are counted and reported instead.
-/// The values the install script asks to be hidden inside the game's own archives: the CD keys
-/// and the account name. None of them is a file the payload carries — the real installer prompts
-/// for them and encrypts what it is told, which is why nothing here comes out of the Tome.
-///
-/// A key is per-product and the two are NOT interchangeable: classic and expansion are separate
-/// keys, sixteen or twenty-six characters, written to different archives. The script says which
-/// one each `encrypt` wants, so the caller supplies both and the manifest does the choosing.
-const Secrets = struct {
-    classic: ?[]const u8 = null,
-    expansion: ?[]const u8 = null,
-    owner: ?[]const u8 = null,
-
-    fn any(self: Secrets) bool {
-        return self.classic != null or self.expansion != null or self.owner != null;
-    }
-
-    /// What this `encrypt` should store, or null if the caller gave nothing for it. The owner name
-    /// carries no product id, which is exactly how it is told apart from a key.
-    fn textFor(self: Secrets, object: []const u8, product_id: ?u16) ?[]const u8 {
-        if (std.mem.eql(u8, object, "user")) return self.owner;
-        if (!std.mem.startsWith(u8, object, "cdkey")) return null;
-        return switch (product_id orelse return null) {
-            @intFromEnum(keystore.Product.classic) => self.classic,
-            @intFromEnum(keystore.Product.expansion) => self.expansion,
-            else => null,
-        };
-    }
-};
 
 /// Say so when a key is not one the game would accept, rather than writing it and leaving the
 /// rejection to happen later at a Battle.net login with nothing pointing back here.
@@ -938,165 +515,6 @@ fn checkKey(kind: []const u8, key: []const u8) void {
         },
     };
     if (!ok) std.debug.print("  !! the {s} key does not decode — check it for a typo\n", .{kind});
-}
-
-fn install(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    payload: []const u8,
-    game: []const u8,
-    platform: []const u8,
-    language: []const u8,
-    version: ?[]const u8,
-    patch_source: []const u8,
-    secrets: Secrets,
-    client: *std.http.Client,
-) !void {
-    // The script names its own archives Tome1..Tome6; a payload has one of them, or a few.
-    var set: mpq.Set = .{};
-    defer set.deinit(gpa);
-    var found: usize = 0;
-    for (0..6) |n| {
-        const name = if (n == 0)
-            try std.fmt.allocPrint(gpa, "{s}/Installer Tome.mpq", .{payload})
-        else
-            try std.fmt.allocPrint(gpa, "{s}/Installer Tome {d}.mpq", .{ payload, n + 1 });
-        const bytes = readFile(gpa, io, name) catch continue;
-        set.add(gpa, bytes) catch continue;
-        found += 1;
-    }
-    if (found == 0) {
-        std.debug.print("no Installer Tome in {s}\n", .{payload});
-        return error.NoTome;
-    }
-
-    const manifest = set.read(gpa, script.manifest_path) catch {
-        std.debug.print("the payload carries no install script\n", .{});
-        return error.NoManifest;
-    };
-    // An expansion installs over the base game, and deletes from where it already sits.
-    const original = try std.fmt.allocPrint(gpa, "{s}/", .{game});
-    const plan = try script.parse(gpa, manifest, .{
-        .platform = if (std.mem.eql(u8, platform, "macos")) .macos else .win32,
-        .language = language,
-        .symbols = &.{.{ .name = "OriginalInstallPath", .value = original }},
-    });
-
-    std.debug.print("\ninstalling {d} operations from {d} archive(s) -> {s}\n", .{ plan.ops.len, found, game });
-    try mkdirs(io, game);
-
-    var wrote: usize = 0;
-    var added: usize = 0;
-    var hidden: usize = 0;
-    var elsewhere: usize = 0;
-
-    // Everything bound for an archive, gathered per container so each one is rewritten once.
-    // Members and encrypted values go through the same door on purpose: they land in the same
-    // archives, and a 250 MB archive rewritten twice for two kinds of write is 250 MB of waste.
-    var bound: std.StringArrayHashMapUnmanaged(std.ArrayList(mpq.NewFile)) = .empty;
-    const bind = struct {
-        fn add(a: std.mem.Allocator, m: *std.StringArrayHashMapUnmanaged(std.ArrayList(mpq.NewFile)), container: []const u8, f: mpq.NewFile) !void {
-            const slot = try m.getOrPut(a, container);
-            if (!slot.found_existing) slot.value_ptr.* = .empty;
-            try slot.value_ptr.append(a, f);
-        }
-    }.add;
-
-    for (plan.ops) |op| switch (op) {
-        .extract => |f| {
-            const from = f.from orelse continue;
-            const data = set.read(gpa, from) catch continue;
-            defer gpa.free(data);
-            const rel = try gpa.dupe(u8, f.to);
-            defer gpa.free(rel);
-            for (rel) |*c| if (c.* == '\\') {
-                c.* = '/';
-            };
-            const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
-            defer gpa.free(full);
-            if (std.mem.lastIndexOfScalar(u8, full, '/')) |cut| try mkdirs(io, full[0..cut]);
-            try writeWhole(io, full, data);
-            wrote += 1;
-        },
-        .add_to_archive => |a| {
-            const from = a.file.from orelse continue;
-            const data = set.read(gpa, from) catch continue;
-            try bind(gpa, &bound, a.container, .{ .name = a.file.to, .data = data });
-        },
-        .encrypt => |e| {
-            const container = e.container orelse {
-                elsewhere += 1;
-                continue;
-            };
-            const text = secrets.textFor(e.object, e.product_id) orelse {
-                elsewhere += 1;
-                continue;
-            };
-            // The wrapping password is fixed for every install on earth, so nothing about this
-            // depends on the machine it runs on: the same key produces a blob any copy reads.
-            const pw = keystore.blockKey();
-            const blob = try gpa.alloc(u8, keystore.wrappedLen(text.len));
-            keystore.encrypt(blob, text, &pw);
-            try bind(gpa, &bound, container, .{ .name = e.into, .data = blob });
-            std.debug.print("  storing {s} in {s}\n", .{ e.object, container });
-            hidden += 1;
-        },
-        .delete => |path| {
-            const rel = try gpa.dupe(u8, path);
-            defer gpa.free(rel);
-            for (rel) |*c| if (c.* == '\\') {
-                c.* = '/';
-            };
-            const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
-            defer gpa.free(full);
-            Dir.cwd().deleteFile(io, full) catch {};
-            std.debug.print("  replacing {s}\n", .{rel});
-        },
-        else => elsewhere += 1,
-    };
-
-    // One rewrite per archive, carrying every member bound for it.
-    for (bound.keys(), bound.values()) |container, list| {
-        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, container });
-        defer gpa.free(path);
-        const before = readFile(gpa, io, path) catch continue;
-        defer gpa.free(before);
-        const grown = mpq.append(gpa, before, list.items) catch continue;
-        defer gpa.free(grown);
-        try writeWhole(io, path, grown);
-        added += list.items.len;
-    }
-
-    std.debug.print("{d} files, {d} members added to installed archives, {d} steps only Windows can do\n", .{ wrote, added, elsewhere });
-    if (secrets.any() and hidden == 0)
-        std.debug.print("!! nothing was stored: this script asks for no value the given options supply\n", .{});
-
-    if (version) |v| try patchTo(gpa, io, client, &set, game, v, found > 0 and set.has("PC-100x\\Game.exe"), patch_source);
-    std.debug.print("the game is in {s}\n", .{game});
-    if (version) |v| if (copyProtected(v)) std.debug.print(
-        \\
-        \\!! {s} will not start on current Windows, and nothing is missing from the install.
-        \\   Its Game.exe is Blizzard's, wrapped in SafeDisc: the copy protection on every Diablo II
-        \\   client before 1.12. It wants the play disc, read through a driver Windows 10 and later no
-        \\   longer ship; without them it exits within seconds, with no window and exit code 2. 1.12a
-        \\   and later carry no copy protection.
-        \\
-    , .{v});
-}
-
-/// Whether the Windows `Game.exe` of a version is wrapped in SafeDisc. Every client from 1.00 to
-/// 1.11b is (sections `.cms_t`/`.cms_d`, later randomly named ones); 1.12a dropped the disc check
-/// and with it the wrapper. Versions are written `1.09b`, so the two digits after `1.` decide.
-fn copyProtected(version: []const u8) bool {
-    if (!std.mem.startsWith(u8, version, "1.")) return false;
-    var minor: u32 = 0;
-    var digits: usize = 0;
-    for (version[2..]) |c| {
-        if (c < '0' or c > '9') break;
-        minor = minor * 10 + (c - '0');
-        digits += 1;
-    }
-    return digits != 0 and minor < 12;
 }
 
 /// A piece map, the way a torrent client draws one: a grid of cells, each standing for a run of
@@ -1196,255 +614,40 @@ const Grid = struct {
     }
 };
 
-/// The shared state a set of fetch workers pulls from. Counters are atomic and the piece cursor
-/// is a fetch-and-add, so a worker only ever needs the next index and never waits on the others.
-const Fetch = struct {
-    meta: legacy.Metainfo,
-    order: []const usize,
-    from: usize,
-    last: usize,
-    dest: []const u8,
-    retries: usize,
-    grid: ?*Grid,
-
-    cursor: usize = 0,
-    done: usize = 0,
-    failed: usize = 0,
-    resumed: usize = 0,
-    gave_up: bool = false,
-
-    fn take(f: *Fetch) ?usize {
-        const i = @atomicRmw(usize, &f.cursor, .Add, 1, .monotonic);
-        if (i >= f.order.len) return null;
-        return f.order[i];
-    }
-
-    fn work(f: *Fetch) void {
-        // Everything here is this thread's own: its allocator, its Io and its HTTP client.
-        // An arena is not shared safely, and neither is the process-wide Io.
-        // The client and the Io outlive every piece, so they must NOT come from the arena that
-        // gets reset per piece - resetting it would pull their memory out from under them.
-        const stable = std.heap.page_allocator;
-        var threaded: std.Io.Threaded = .init(stable, .{});
-        defer threaded.deinit();
-        const io = threaded.io();
-
-        var client: std.http.Client = .{ .allocator = stable, .io = io };
-        defer client.deinit();
-
-        var scratch_state = std.heap.ArenaAllocator.init(stable);
-        defer scratch_state.deinit();
-
-        while (f.take()) |p| {
-            if (@atomicLoad(bool, &f.gave_up, .monotonic)) return;
-            _ = scratch_state.reset(.retain_capacity);
-            const scratch = scratch_state.allocator();
-            const want = f.meta.pieceSize(p);
-
-            // Anything already on disk and matching its hash is left alone, so an interrupted
-            // fetch resumes instead of downloading what it already has.
-            if (scratch.alloc(u8, want)) |buf| {
-                if (readPiece(f.meta, scratch, io, f.dest, p, buf)) |have| {
-                    if (f.meta.verify(p, have)) |_| {
-                        _ = @atomicRmw(usize, &f.resumed, .Add, 1, .monotonic);
-                        f.finish(p, true, io);
-                        continue;
-                    } else |_| {}
-                } else |_| {}
-            } else |_| {}
-
-            var attempt: usize = 0;
-            var last_err: []const u8 = "unknown";
-            const ok = while (attempt <= f.retries) : (attempt += 1) {
-                // The salt is the downloader's own cache-buster, used only after a bad piece.
-                var salt: [12]u8 = undefined;
-                const s: ?[]const u8 = if (attempt == 0) null else blk: {
-                    const alpha = "abcdefghijklmnopqrstuvwxyz1234567890";
-                    var prng = std.Random.DefaultPrng.init(@as(u64, p) *% 1000003 +% attempt);
-                    for (&salt) |*c| c.* = alpha[prng.random().uintLessThan(usize, alpha.len)];
-                    break :blk salt[0..];
-                };
-                // Each retry moves to the next server whose range covers this piece, so a
-                // mirror that is down costs one attempt rather than every attempt.
-                const url = f.meta.pieceUrlFrom(scratch, p, s, attempt) catch continue;
-                const body = fetchUrl(scratch, &client, url) catch |e| {
-                    last_err = if (e == error.HttpStatus)
-                        std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
-                    else
-                        @errorName(e);
-                    continue;
-                };
-                if (body.len != want) {
-                    last_err = "short read";
-                    continue;
-                }
-                f.meta.verify(p, body) catch {
-                    last_err = "hash mismatch";
-                    continue;
-                };
-                writePiece(f.meta, scratch, io, f.dest, p, body) catch |e| {
-                    last_err = @errorName(e);
-                    continue;
-                };
-                break true;
-            } else false;
-
-            f.finish(p, ok, io);
-            if (!ok) {
-                std.debug.print("\n  piece {d}: {s} after {d} tries\n", .{ p, last_err, f.retries + 1 });
-                // One failure is a blip; a wall of them with nothing succeeding means the CDN
-                // is refusing us, and grinding through thousands of pieces to learn that
-                // helps nobody.
-                if (@atomicLoad(usize, &f.failed, .monotonic) >= 8 and
-                    @atomicLoad(usize, &f.done, .monotonic) == 0)
-                {
-                    @atomicStore(bool, &f.gave_up, true, .monotonic);
-                    return;
-                }
-            }
-        }
-    }
-
-    fn finish(f: *Fetch, piece: usize, ok: bool, io: std.Io) void {
-        if (ok) _ = @atomicRmw(usize, &f.done, .Add, 1, .monotonic) else _ = @atomicRmw(usize, &f.failed, .Add, 1, .monotonic);
-
-        const done = @atomicLoad(usize, &f.done, .monotonic);
-        const failed = @atomicLoad(usize, &f.failed, .monotonic);
-        if (f.grid) |g| {
-            g.mark(piece - f.from, ok);
-            g.io = io;
-            g.draw(done, failed, !ok);
-        } else if (done % 25 == 0 or piece == f.last) {
-            std.debug.print("\r  {d}/{d} pieces", .{ done, f.order.len });
-        }
-    }
-};
-
-/// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
-fn resolveStub(
+/// The terminal side of the library's progress: the piece map (or a plain counter when stderr is
+/// not a terminal) and every line of text, printed as it arrives.
+const Term = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    client: *std.http.Client,
-    arg: []const u8,
-    locale: []const u8,
-    os_: []const u8,
-) ![]u8 {
-    if (readFile(gpa, io, arg)) |bytes| return bytes else |_| {}
+    tty: bool,
+    rep: installer.Reporter = .init(null),
+    grid: ?Grid = null,
+    done: usize = 0,
+    failed: usize = 0,
 
-    var code: std.ArrayList(u8) = .empty;
-    for (arg) |c| try code.append(gpa, std.ascii.toUpper(c));
-    const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{
-        getlegacy, code.items, locale, os_,
-    });
-    const body = fetchUrl(gpa, client, url) catch {
-        std.debug.print("no file '{s}', and fetching product {s} failed\n", .{ arg, code.items });
-        return error.NoStub;
-    };
-    // The endpoint answers 200 with nothing when it is rate-limiting, so size is the real check.
-    if (body.len < 1024) {
-        std.debug.print("product {s} ({s}, {s}) returned nothing — unknown product, or you are being rate-limited\n", .{ code.items, locale, os_ });
-        return error.NoStub;
+    fn report(ctx: ?*anyopaque, ev: installer.Event) void {
+        const t: *Term = @ptrCast(@alignCast(ctx.?));
+        if (ev.pieces) |p| {
+            if (p.index) |index| {
+                t.done = p.done;
+                t.failed = p.failed;
+                if (t.grid) |*g| {
+                    g.mark(index - p.first, p.ok);
+                    g.draw(p.done, p.failed, !p.ok);
+                } else if (p.done % 25 == 0 or index == p.first + p.count - 1) {
+                    std.debug.print("\r  {d}/{d} pieces", .{ p.done, p.count });
+                }
+            } else {
+                // The map only makes sense on a terminal; piped or in CI it would be a wall of
+                // escapes.
+                t.done = 0;
+                t.failed = 0;
+                t.grid = if (t.tty) Grid.init(t.gpa, t.io, p.count) catch null else null;
+            }
+        } else if (ev.message.len != 0 and ev.stage == .downloading) {
+            // The closing line of a download goes under a final, complete map.
+            if (t.grid) |*g| g.draw(t.done, t.failed, true);
+        }
+        if (ev.message.len != 0) std.debug.print("{s}", .{ev.message});
     }
-    return body;
-}
-
-/// The status of the last failed fetch, so a piece failure can say 403 rather than "HttpStatus".
-threadlocal var last_status: u16 = 0;
-
-// The CDN access token, sent as a Cookie on every piece request.
-var cookie: ?[]const u8 = null;
-
-fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    // `Pragma: no-cache` is not the program's doing: the client opens every request with
-    // INTERNET_FLAG_RELOAD, and that is what WinInet puts on the wire for it.
-    const with_cookie = [_]std.http.Header{
-        .{ .name = "Pragma", .value = "no-cache" },
-        .{ .name = "Cookie", .value = cookie orelse "" },
-    };
-    const res = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .headers = .{ .user_agent = .{ .override = legacy.user_agent } },
-        .extra_headers = if (cookie != null) &with_cookie else &.{
-            .{ .name = "Pragma", .value = "no-cache" },
-        },
-        .response_writer = &body.writer,
-    });
-    if (res.status != .ok and res.status != .partial_content) {
-        last_status = @intFromEnum(res.status);
-        return error.HttpStatus;
-    }
-    return body.written();
-}
-
-/// A piece rarely lands in one file — it routinely straddles the end of one and the start of
-/// the next — so writing one means walking its spans.
-fn writePiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, io: std.Io, dest: []const u8, index: usize, data: []const u8) !void {
-    var at: usize = 0;
-    for (try legacy.spansForPiece(meta, gpa, index)) |s| {
-        const full = try zpath(gpa, &.{ dest, meta.files[s.file].path });
-        const f = try openFile(io, full, .read_write);
-        defer f.close(io);
-        const n: usize = @intCast(s.len);
-        try f.writePositionalAll(io, data[at..][0..n], s.offset);
-        at += n;
-    }
-}
-
-fn readPiece(meta: legacy.Metainfo, gpa: std.mem.Allocator, io: std.Io, dest: []const u8, index: usize, buf: []u8) ![]u8 {
-    var at: usize = 0;
-    for (try legacy.spansForPiece(meta, gpa, index)) |s| {
-        const full = try zpath(gpa, &.{ dest, meta.files[s.file].path });
-        const f = try openFile(io, full, .read_only);
-        defer f.close(io);
-        const n: usize = @intCast(s.len);
-        at += try f.readPositionalAll(io, buf[at..][0..n], s.offset);
-    }
-    return buf[0..at];
-}
-
-test "every version before 1.12a is flagged as copy-protected, and none after" {
-    for ([_][]const u8{ "1.00", "1.06b", "1.07", "1.09b", "1.09d", "1.10", "1.11b" }) |v|
-        try std.testing.expect(copyProtected(v));
-    for ([_][]const u8{ "1.12a", "1.13c", "1.13d", "1.14b", "1.14d", "", "1.", "2.4" }) |v|
-        try std.testing.expect(!copyProtected(v));
-}
-
-test "only an (attributes) the old Storm.dll cannot use is unlisted, and nothing else moves" {
-    const gpa = std.testing.allocator;
-    const Case = struct { carries: u32, unlisted: bool };
-    for ([_]Case{
-        .{ .carries = 0x7, .unlisted = true }, // CRC32, FILETIME and MD5, as the 1.14 d2sfx.mpq has
-        .{ .carries = 0x3, .unlisted = false }, // CRC32 and FILETIME, as d2exp.mpq has
-    }) |case| {
-        var attrs: [8]u8 = undefined;
-        std.mem.writeInt(u32, attrs[0..4], 100, .little);
-        std.mem.writeInt(u32, attrs[4..8], case.carries, .little);
-
-        const empty = try mpq.empty(gpa, 16);
-        defer gpa.free(empty);
-        const built = try mpq.append(gpa, empty, &.{
-            .{ .name = "data\\global\\sfx\\cursor\\button.wav", .data = "RIFF" },
-            .{ .name = "(attributes)", .data = &attrs },
-        });
-        defer gpa.free(built);
-        const before = try gpa.dupe(u8, built);
-        defer gpa.free(before);
-
-        try std.testing.expectEqual(case.unlisted, try unhookModernAttributes(gpa, built));
-        try std.testing.expectEqual(before.len, built.len);
-
-        var arc = try mpq.Archive.open(gpa, built);
-        defer arc.deinit(gpa);
-        try std.testing.expectEqual(!case.unlisted, arc.lookup("(attributes)") != null);
-        const wav = try arc.read(gpa, "data\\global\\sfx\\cursor\\button.wav");
-        defer gpa.free(wav);
-        try std.testing.expectEqualStrings("RIFF", wav);
-        // Everything outside the hash table is untouched.
-        const table_at = arc.base + arc.header.hash_table_pos;
-        try std.testing.expectEqualSlices(u8, before[0..table_at], built[0..table_at]);
-        const table_end = table_at + arc.hashes.len * 16;
-        try std.testing.expectEqualSlices(u8, before[table_end..], built[table_end..]);
-    }
-}
+};

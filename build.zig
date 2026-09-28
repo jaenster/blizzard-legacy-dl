@@ -16,6 +16,19 @@ pub fn build(b: *std.Build) void {
     // live in libd2 rather than being carried a second time here.
     const libd2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
 
+    // The install pipeline, for a program that embeds it instead of running the CLI:
+    // `.imports = &.{ .{ .name = "installer", .module = dep.module("installer") } }`
+    const installer = b.addModule("installer", .{
+        .root_source_file = b.path("src/installer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "legacy", .module = legacy },
+            .{ .name = "libd2", .module = libd2.module("libd2") },
+        },
+        .link_libc = true,
+    });
+
     const cli = b.addExecutable(.{
         .name = "blizzard-legacy-dl",
         .root_module = b.createModule(.{
@@ -42,17 +55,60 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = legacy });
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
-    // the installer's own archive surgery, over archives built in memory
     const cli_tests = b.addTest(.{ .root_module = cli.root_module });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+
+    // the installer's own archive surgery, over archives built in memory
+    const installer_tests = b.addTest(.{ .root_module = installer });
+    test_step.dependOn(&b.addRunArtifact(installer_tests).step);
 
     // fetch, verify and reassembly against a payload built and served on the spot
     const e2e = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/e2e.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "legacy", .module = legacy }},
+        .imports = &.{
+            .{ .name = "legacy", .module = legacy },
+            .{ .name = "installer", .module = installer },
+            .{ .name = "libd2", .module = libd2.module("libd2") },
+        },
         .link_libc = true,
     }) });
     test_step.dependOn(&b.addRunArtifact(e2e).step);
+
+    // A program embedding the "installer" module must build for Windows, whatever the host.
+    const embed = b.addObject(.{
+        .name = "installer-embed-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/embed_check.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+            .optimize = optimize,
+            .imports = &.{.{ .name = "installer", .module = installerFor(b, .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, optimize) }},
+            .link_libc = true,
+        }),
+    });
+    const check_windows = b.step("check-windows", "Compile a program that embeds the installer module, for x86_64-windows-gnu");
+    check_windows.dependOn(&embed.step);
+    test_step.dependOn(check_windows);
+}
+
+/// The installer module built for a target other than the one given on the command line.
+fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const target = b.resolveTargetQuery(query);
+    const libd2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
+    const legacy = b.createModule(.{
+        .root_source_file = b.path("src/legacy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    return b.createModule(.{
+        .root_source_file = b.path("src/installer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "legacy", .module = legacy },
+            .{ .name = "libd2", .module = libd2.module("libd2") },
+        },
+        .link_libc = true,
+    });
 }
