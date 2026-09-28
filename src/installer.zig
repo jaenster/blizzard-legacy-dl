@@ -283,6 +283,23 @@ pub fn defaultCacheDir(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
     return dir;
 }
 
+/// A relative path of plain names: no wildcard, variable, drive, stream or `..`.
+pub fn plainRelative(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '/') return false;
+    if (std.mem.indexOfAny(u8, rel, "*?\"<>|:$%") != null) return false;
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return false;
+        for (part) |c| if (c < 0x20) return false;
+    }
+    return true;
+}
+
+test "only plain relative names are deleted" {
+    for ([_][]const u8{ "D2Debug.txt", "support/x.txt", "Diablo II.lnk" }) |p| try std.testing.expect(plainRelative(p));
+    for ([_][]const u8{ "", "/x", "D2Debug*.txt", "$(ProgramMenu)/x.lnk", "C:/x", "../x", "a//b", "a/./b", "a?b" }) |p| try std.testing.expect(!plainRelative(p));
+}
+
 /// Create every directory on the way to `path`, ignoring the ones already there.
 pub fn mkdirs(io: std.Io, path: []const u8) !void {
     // A Windows absolute path starts with a drive or a share, not with "/": it goes to the cwd's
@@ -873,6 +890,12 @@ fn installPayload(
                 for (rel) |*c| if (c.* == '\\') {
                     c.* = '/';
                 };
+                // Only a plain file inside the game folder: the script also names wildcards, variables
+                // and places outside it, and Windows treats such a name as a caller's bug, not an error.
+                if (!plainRelative(rel)) {
+                    rep.say(.installing, "  not deleting {s} (not a plain file in the game folder)\n", .{rel});
+                    continue;
+                }
                 const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
                 defer gpa.free(full);
                 if (std.mem.lastIndexOfScalar(u8, full, '/')) |cut| try mkdirs(io, full[0..cut]);
@@ -908,6 +931,12 @@ fn installPayload(
                 for (rel) |*c| if (c.* == '\\') {
                     c.* = '/';
                 };
+                // Only a plain file inside the game folder: the script also names wildcards, variables
+                // and places outside it, and Windows treats such a name as a caller's bug, not an error.
+                if (!plainRelative(rel)) {
+                    rep.say(.installing, "  not deleting {s} (not a plain file in the game folder)\n", .{rel});
+                    continue;
+                }
                 const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
                 defer gpa.free(full);
                 Dir.cwd().deleteFile(io, full) catch {};
