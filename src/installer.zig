@@ -9,6 +9,7 @@
 //! `Options.progress`, as `Event.message` text alongside the counters.
 
 const std = @import("std");
+const watch_mod = @import("watch");
 pub const legacy = @import("legacy");
 const libd2 = @import("libd2");
 const mpq = libd2.formats.mpq;
@@ -608,95 +609,8 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
 /// A CDN connection can stay open and send nothing; without a limit the whole download waits on it forever.
 pub const piece_timeout_ms: u64 = 60_000;
 
-/// A deadline for one request at a time, kept by a thread of its own. When the request runs past
-/// it, its connection is shut down, which ends a read that is waiting on a server that went quiet.
-///
-/// This deliberately uses no `std.Io` task, select or cancelation: on Windows, Zig 0.16's
-/// `Io.Threaded` can lose the wakeup of its internal parking mutex, and a worker waiting on a
-/// cancelled task then never returns (seen as one piece that never arrives). Every `Io` the fetch
-/// path uses is single-threaded, and the watchdog touches only the socket.
-pub const Watch = struct {
-    lock: std.atomic.Value(bool) = .init(false),
-    stream: ?std.Io.net.Stream = null,
-    /// Milliseconds on the `.awake` clock; 0 while no request is running.
-    deadline_ms: std.atomic.Value(i64) = .init(0),
-    expired: std.atomic.Value(bool) = .init(false),
-    stop: std.atomic.Value(bool) = .init(false),
-
-    fn acquire(w: *Watch) void {
-        while (w.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    }
-    fn release(w: *Watch) void {
-        w.lock.store(false, .release);
-    }
-
-    fn attach(w: *Watch, stream: std.Io.net.Stream) void {
-        w.acquire();
-        defer w.release();
-        w.stream = stream;
-    }
-    /// After this, the watchdog no longer touches the socket, so it may be closed or reused.
-    fn detach(w: *Watch) void {
-        w.acquire();
-        defer w.release();
-        w.stream = null;
-    }
-
-    fn begin(w: *Watch, io: std.Io, timeout_ms: u64) void {
-        w.expired.store(false, .release);
-        w.deadline_ms.store(nowMs(io) + @as(i64, @intCast(timeout_ms)), .release);
-    }
-    /// Whether the request ran past its deadline.
-    fn end(w: *Watch) bool {
-        w.deadline_ms.store(0, .release);
-        return w.expired.load(.acquire);
-    }
-
-    /// The watchdog: until `stop`, shut down the connection of a request past its deadline.
-    pub fn run(w: *Watch) void {
-        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
-        defer threaded.deinit();
-        const io = threaded.io();
-        while (!w.stop.load(.acquire)) {
-            std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
-            const d = w.deadline_ms.load(.acquire);
-            if (d == 0 or nowMs(io) < d or w.expired.load(.acquire)) continue;
-            w.expired.store(true, .release);
-            w.acquire();
-            defer w.release();
-            if (w.stream) |s| abortConnection(io, s);
-        }
-    }
-};
-
-/// End every read and write waiting on `s`. A POSIX shutdown does that; on Windows only an
-/// abortive disconnect does (a graceful one leaves a pending receive waiting), and closing the
-/// socket instead would complete the receive as cancelled, which Zig's reader treats as impossible.
-fn abortConnection(io: std.Io, s: std.Io.net.Stream) void {
-    if (@import("builtin").os.tag != .windows) {
-        s.shutdown(io, .both) catch {};
-        return;
-    }
-    const windows = std.os.windows;
-    const ev = CreateEventW(null, .TRUE, .FALSE, null) orelse return;
-    defer windows.CloseHandle(ev);
-    // Kept alive past a wait that times out: the driver may still write it.
-    const iosb = std.heap.page_allocator.create(windows.IO_STATUS_BLOCK) catch return;
-    var info: windows.AFD.PARTIAL_DISCONNECT_INFO = .{
-        .DisconnectMode = .{ .SEND = true, .RECEIVE = true, .ABORTIVE = true },
-        .Timeout = -1,
-    };
-    const st = windows.ntdll.NtDeviceIoControlFile(s.socket.handle, ev, null, null, iosb, windows.IOCTL.AFD.PARTIAL_DISCONNECT, &info, @sizeOf(@TypeOf(info)), null, 0);
-    if (st == .PENDING and WaitForSingleObject(ev, 5000) != 0) return; // leave `iosb` to the driver
-    std.heap.page_allocator.destroy(iosb);
-}
-
-extern "kernel32" fn CreateEventW(attrs: ?*anyopaque, manual: std.os.windows.BOOL, initial: std.os.windows.BOOL, name: ?[*:0]const u16) callconv(.winapi) ?std.os.windows.HANDLE;
-extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: u32) callconv(.winapi) u32;
-
-fn nowMs(io: std.Io) i64 {
-    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
-}
+/// A deadline for one request at a time, kept by a thread of its own (watch.zig).
+pub const Watch = watch_mod.Watch;
 
 /// One request under `watch`'s deadline: error.Timeout once it runs past `timeout_ms`. A request
 /// still connecting when the deadline passes ends by the system's own connect and lookup timeouts.
@@ -715,17 +629,14 @@ fn fetchAttempt(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, ur
 /// `Watch`.
 pub fn fetchWithin(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, timeout_ms: u64) ![]u8 {
     var watch: Watch = .{};
-    const t = try std.Thread.spawn(.{}, Watch.run, .{&watch});
-    defer {
-        watch.stop.store(true, .release);
-        t.join();
-    }
+    const t = try watch.start();
+    defer watch.stop(t);
     return fetchAttempt(gpa, io, client, url, cookie, &watch, timeout_ms);
 }
 
 /// The `Io` a fetch worker uses: everything on the calling thread (see `Watch`).
 pub fn workerIo(threaded: *std.Io.Threaded) void {
-    threaded.* = .init(std.heap.page_allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    watch_mod.singleThreaded(threaded, std.heap.page_allocator);
 }
 
 /// The shared state a set of fetch workers pulls from. The piece cursor is a fetch-and-add, so a
@@ -770,11 +681,8 @@ const Fetch = struct {
         const io = threaded.io();
 
         var watch: Watch = .{};
-        const watchdog = std.Thread.spawn(.{}, Watch.run, .{&watch}) catch null;
-        defer if (watchdog) |t| {
-            watch.stop.store(true, .release);
-            t.join();
-        };
+        const watchdog = watch.start() catch null;
+        defer if (watchdog) |t| watch.stop(t);
 
         var client: std.http.Client = .{ .allocator = stable, .io = io };
         defer client.deinit();

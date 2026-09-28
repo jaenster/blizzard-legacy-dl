@@ -12,6 +12,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // A request deadline kept on the socket by a thread of its own, for any HTTP client in an embedder:
+    // `.imports = &.{ .{ .name = "watch", .module = dep.module("watch") } }`
+    const watch = b.addModule("watch", .{
+        .root_source_file = b.path("src/watch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The installer half needs the MPQ reader and the install-script reader, both of which
     // live in libd2 rather than being carried a second time here.
     const libd2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
@@ -25,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "legacy", .module = legacy },
             .{ .name = "libd2", .module = libd2.module("libd2") },
+            .{ .name = "watch", .module = watch },
         },
         .link_libc = true,
     });
@@ -38,6 +47,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "legacy", .module = legacy },
                 .{ .name = "libd2", .module = libd2.module("libd2") },
+                .{ .name = "watch", .module = watch },
             },
             // the file IO goes through libc: std.fs is reworked under 0.16's Io interface
             .link_libc = true,
@@ -120,6 +130,11 @@ fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.builtin.Op
         .target = target,
         .optimize = optimize,
     });
+    const watch = b.createModule(.{
+        .root_source_file = b.path("src/watch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     return b.createModule(.{
         .root_source_file = b.path("src/installer.zig"),
         .target = target,
@@ -127,6 +142,7 @@ fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.builtin.Op
         .imports = &.{
             .{ .name = "legacy", .module = legacy },
             .{ .name = "libd2", .module = libd2.module("libd2") },
+            .{ .name = "watch", .module = watch },
         },
         .link_libc = true,
     });
