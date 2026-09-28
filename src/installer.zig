@@ -285,6 +285,9 @@ pub fn defaultCacheDir(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
 
 /// Create every directory on the way to `path`, ignoring the ones already there.
 pub fn mkdirs(io: std.Io, path: []const u8) !void {
+    // A Windows absolute path starts with a drive or a share, not with "/": it goes to the cwd's
+    // createDirPath whole, which resolves it without the cwd.
+    if (@import("builtin").os.tag == .windows) return Dir.cwd().createDirPath(io, path);
     if (std.fs.path.isAbsolute(path)) {
         var root = try Dir.openDirAbsolute(io, "/", .{});
         defer root.close(io);
