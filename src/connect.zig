@@ -13,8 +13,9 @@ pub const max_addresses = 8;
 
 /// How long to let one address hold the others back before the next is tried alongside it.
 pub const stagger_ms = 250;
-/// How long to wait for any address at all.
-pub const give_up_ms = 8000;
+/// How long to wait for any address at all: past it the request fails with error.ConnectionTimedOut and the caller's
+/// own retry with backoff takes over, rather than the operating system's 21 s wait for one family.
+pub const give_up_ms = 6000;
 
 pub const Result = enum(u8) { pending, connected, failed };
 
@@ -67,17 +68,29 @@ fn attemptThread(s: *Shared, i: usize) void {
     }
 }
 
-/// IPv4 addresses ahead of IPv6, each family in the order given.
+/// IPv6 and IPv4 addresses alternating, IPv6 first, each family in the order given (RFC 8305): a family that
+/// goes nowhere is never the only one tried.
 pub fn ordered(addrs: []const net.IpAddress, out: []net.IpAddress) []net.IpAddress {
     var n: usize = 0;
-    for (addrs) |a| if (a == .ip4 and n < out.len) {
-        out[n] = a;
+    var ix6: usize = 0;
+    var ix4: usize = 0;
+    var want6 = true;
+    while (n < out.len) {
+        while (ix6 < addrs.len and addrs[ix6] != .ip6) ix6 += 1;
+        while (ix4 < addrs.len and addrs[ix4] != .ip4) ix4 += 1;
+        const have6 = ix6 < addrs.len;
+        const have4 = ix4 < addrs.len;
+        if (!have6 and !have4) break;
+        if ((want6 and have6) or !have4) {
+            out[n] = addrs[ix6];
+            ix6 += 1;
+        } else {
+            out[n] = addrs[ix4];
+            ix4 += 1;
+        }
         n += 1;
-    };
-    for (addrs) |a| if (a == .ip6 and n < out.len) {
-        out[n] = a;
-        n += 1;
-    };
+        want6 = !want6;
+    }
     return out[0..n];
 }
 
@@ -208,21 +221,84 @@ pub fn resolve(io: std.Io, host: []const u8, port: u16, out: []net.IpAddress) ![
     return ordered(found[0..n], out);
 }
 
+/// A connection to `uri`'s host for `client`: one it already holds, else one to whichever of the host's addresses
+/// answers first, verified as the host itself (the address only says where to connect; the certificate and the
+/// Host header are the name's). Pass it as `RequestOptions.connection`, or use `warm` for a client that fetches.
+pub fn open(client: *std.http.Client, uri: std.Uri) !*std.http.Client.Connection {
+    const io = client.io;
+    var name_buf: [net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&name_buf);
+    const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
+    // The certificate roots, loaded once per client, as `Client.request` does before it connects.
+    if (protocol == .tls) tls: {
+        {
+            try client.ca_bundle_lock.lockShared(io);
+            defer client.ca_bundle_lock.unlockShared(io);
+            if (client.now != null) break :tls;
+        }
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const now = std.Io.Clock.real.now(io);
+        bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => return error.CertificateBundleLoadFailure,
+        };
+        try client.ca_bundle_lock.lock(io);
+        defer client.ca_bundle_lock.unlock(io);
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    }
+    const port = uri.port orelse @as(u16, if (protocol == .tls) 443 else 80);
+    if (client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return c;
+    var found: [32]net.IpAddress = undefined;
+    const addrs = try resolve(io, host.bytes, port, &found);
+    // One address leaves nothing to choose between: the ordinary connect.
+    if (addrs.len == 1) return client.connectTcpOptions(.{ .host = host, .port = port, .protocol = protocol });
+    const winner = try race(io, addrs, stagger_ms, give_up_ms);
+    var lit: [64]u8 = undefined;
+    return client.connectTcpOptions(.{
+        .host = .{ .bytes = literal(winner, &lit) },
+        .port = port,
+        .protocol = protocol,
+        .proxied_host = host,
+        .proxied_port = port,
+    });
+}
+
+/// Opens a connection to `url`'s host the way `open` does and leaves it in the client's pool, so the `fetch` or
+/// `request` that follows picks it up instead of connecting the standard way.
+pub fn warm(client: *std.http.Client, url: []const u8) !void {
+    const conn = try open(client, try std.Uri.parse(url));
+    client.connection_pool.release(conn, client.io);
+}
+
 const testing = std.testing;
 
-test "IPv4 goes ahead of IPv6, each in the order the resolver gave" {
+test "IPv6 and IPv4 alternate, IPv6 first, each in the order the resolver gave" {
     const a = [_]net.IpAddress{
-        net.IpAddress.parse("2a02:26f0:1180:71::210:6a08", 443) catch unreachable,
         net.IpAddress.parse("95.101.74.217", 443) catch unreachable,
-        net.IpAddress.parse("2a02:26f0:1180:71::210:6a09", 443) catch unreachable,
+        net.IpAddress.parse("2a02:26f0:1180:71::210:6a08", 443) catch unreachable,
         net.IpAddress.parse("95.101.74.218", 443) catch unreachable,
+        net.IpAddress.parse("2a02:26f0:1180:71::210:6a09", 443) catch unreachable,
+        net.IpAddress.parse("95.101.74.219", 443) catch unreachable,
     };
     var out: [8]net.IpAddress = undefined;
     const o = ordered(&a, &out);
-    try testing.expectEqual(@as(usize, 4), o.len);
-    try testing.expect(o[0] == .ip4 and o[1] == .ip4 and o[2] == .ip6 and o[3] == .ip6);
-    try testing.expectEqual(@as(u8, 217), o[0].ip4.bytes[3]);
-    try testing.expectEqual(@as(u8, 218), o[1].ip4.bytes[3]);
+    try testing.expectEqual(@as(usize, 5), o.len);
+    try testing.expect(o[0] == .ip6 and o[1] == .ip4 and o[2] == .ip6 and o[3] == .ip4 and o[4] == .ip4);
+    try testing.expectEqual(@as(u8, 217), o[1].ip4.bytes[3]);
+    try testing.expectEqual(@as(u8, 218), o[3].ip4.bytes[3]);
+    try testing.expectEqual(@as(u8, 0x08), o[0].ip6.bytes[15]);
+}
+
+test "one family alone is kept whole" {
+    const a = [_]net.IpAddress{
+        net.IpAddress.parse("2001:db8::1", 443) catch unreachable,
+        net.IpAddress.parse("2001:db8::2", 443) catch unreachable,
+    };
+    var out: [8]net.IpAddress = undefined;
+    try testing.expectEqual(@as(usize, 2), ordered(&a, &out).len);
+    try testing.expectEqual(@as(usize, 0), ordered(&.{}, &out).len);
 }
 
 test "an address as text, without port or brackets" {
@@ -259,4 +335,53 @@ test "when nothing answers the failure is an error, not a hang" {
     server.deinit(io);
     dead.ip4.port = if (dead.ip4.port == 1) 2 else 1;
     try testing.expectError(error.ConnectionRefused, race(io, &.{dead}, 50, 3000));
+}
+
+test "a black-holed IPv6 address does not hold up the IPv4 one" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var any: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try any.listen(io, .{});
+    defer server.deinit(io);
+    // 100::/64 is the discard prefix: nothing routes it, so a connect either fails at once or never answers.
+    const hole = net.IpAddress.parse("100::1", server.socket.address.ip4.port) catch unreachable;
+    const t0 = nowMs(io);
+    const got = try race(io, &.{ hole, server.socket.address }, stagger_ms, give_up_ms);
+    try testing.expectEqual(server.socket.address.ip4.port, got.ip4.port);
+    try testing.expect(nowMs(io) - t0 < give_up_ms / 2);
+    try testing.expect(std.mem.indexOf(u8, last_note.text(), "ok in") != null);
+}
+
+test "an address list that never answers gives up within the limit" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const hole6 = net.IpAddress.parse("100::1", 443) catch unreachable;
+    const hole4 = net.IpAddress.parse("198.51.100.1", 443) catch unreachable;
+    const t0 = nowMs(io);
+    try testing.expect(std.meta.isError(race(io, &.{ hole6, hole4 }, 50, 1500)));
+    // Bounded by the limit we gave, not by the operating system's connect wait.
+    try testing.expect(nowMs(io) - t0 < 4000);
+}
+
+test "live: downloader.battle.net with a dead IPv6 and IPv4 address in front" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var found: [32]net.IpAddress = undefined;
+    const real = resolve(io, "downloader.battle.net", 443, &found) catch return error.SkipZigTest;
+    var list: [34]net.IpAddress = undefined;
+    list[0] = net.IpAddress.parse("100::1", 443) catch unreachable;
+    list[1] = net.IpAddress.parse("198.51.100.1", 443) catch unreachable;
+    @memcpy(list[2 .. 2 + real.len], real);
+    const t0 = nowMs(io);
+    const got = try race(io, list[0 .. 2 + real.len], stagger_ms, give_up_ms);
+    try testing.expect(nowMs(io) - t0 < give_up_ms);
+    var buf: [64]u8 = undefined;
+    const lit = literal(got, &buf);
+    try testing.expect(!std.mem.eql(u8, lit, "100::1") and !std.mem.eql(u8, lit, "198.51.100.1"));
 }

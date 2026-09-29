@@ -20,6 +20,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Connecting to whichever address of a host answers, for any std.http.Client in an embedder (a host with a dead
+    // IPv6 route otherwise costs the operating system's whole connect wait): `dep.module("connect")`.
+    const connect = b.addModule("connect", .{
+        .root_source_file = b.path("src/connect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The installer half needs the MPQ reader and the install-script reader, both of which
     // live in libd2 rather than being carried a second time here.
     const libd2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
@@ -34,6 +42,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "legacy", .module = legacy },
             .{ .name = "libd2", .module = libd2.module("libd2") },
             .{ .name = "watch", .module = watch },
+            .{ .name = "connect", .module = connect },
         },
         .link_libc = true,
     });
@@ -48,6 +57,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "legacy", .module = legacy },
                 .{ .name = "libd2", .module = libd2.module("libd2") },
                 .{ .name = "watch", .module = watch },
+                .{ .name = "connect", .module = connect },
+            .{ .name = "connect", .module = connect },
             },
             // the file IO goes through libc: std.fs is reworked under 0.16's Io interface
             .link_libc = true,
@@ -69,6 +80,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
     // the installer's own archive surgery, over archives built in memory
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = connect })).step);
+
     const installer_tests = b.addTest(.{ .root_module = installer });
     test_step.dependOn(&b.addRunArtifact(installer_tests).step);
 
@@ -135,6 +148,11 @@ fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.builtin.Op
         .target = target,
         .optimize = optimize,
     });
+    const connect = b.createModule(.{
+        .root_source_file = b.path("src/connect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     return b.createModule(.{
         .root_source_file = b.path("src/installer.zig"),
         .target = target,
@@ -143,6 +161,7 @@ fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.builtin.Op
             .{ .name = "legacy", .module = legacy },
             .{ .name = "libd2", .module = libd2.module("libd2") },
             .{ .name = "watch", .module = watch },
+            .{ .name = "connect", .module = connect },
         },
         .link_libc = true,
     });

@@ -13,7 +13,7 @@ const watch_mod = @import("watch");
 pub const legacy = @import("legacy");
 const libd2 = @import("libd2");
 pub const stubfetch = @import("stubfetch.zig");
-pub const connect = @import("connect.zig");
+pub const connect = @import("connect");
 const mpq = libd2.formats.mpq;
 const script = libd2.formats.installer;
 const ptc = libd2.formats.ptc;
@@ -401,49 +401,6 @@ pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u
     return fetchUrlWatched(gpa, client, url, cookie, null);
 }
 
-/// A connection to `uri`'s host: one the client already holds, else one to whichever of the host's addresses
-/// answers first (connect.zig), verified as the host itself.
-fn connectTo(client: *std.http.Client, uri: std.Uri) !*std.http.Client.Connection {
-    const io = client.io;
-    var name_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = try uri.getHost(&name_buf);
-    const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
-    // The certificate roots, loaded once per client, as `Client.request` does before it connects.
-    if (protocol == .tls) tls: {
-        {
-            try client.ca_bundle_lock.lockShared(io);
-            defer client.ca_bundle_lock.unlockShared(io);
-            if (client.now != null) break :tls;
-        }
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        defer bundle.deinit(client.allocator);
-        const now = std.Io.Clock.real.now(io);
-        bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            else => return error.CertificateBundleLoadFailure,
-        };
-        try client.ca_bundle_lock.lock(io);
-        defer client.ca_bundle_lock.unlock(io);
-        client.now = now;
-        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
-    }
-    const port = uri.port orelse @as(u16, if (protocol == .tls) 443 else 80);
-    if (client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return c;
-    var found: [32]std.Io.net.IpAddress = undefined;
-    const addrs = try connect.resolve(io, host.bytes, port, &found);
-    // One address leaves nothing to choose between: the ordinary connect.
-    if (addrs.len == 1) return client.connectTcpOptions(.{ .host = host, .port = port, .protocol = protocol });
-    const winner = try connect.race(io, addrs, connect.stagger_ms, connect.give_up_ms);
-    var lit: [64]u8 = undefined;
-    return client.connectTcpOptions(.{
-        .host = .{ .bytes = connect.literal(winner, &lit) },
-        .port = port,
-        .protocol = protocol,
-        .proxied_host = host,
-        .proxied_port = port,
-    });
-}
-
 /// `fetchUrl`, with the connection handed to `watch` once it is open, so the watchdog can shut it
 /// down when the attempt runs past its deadline.
 fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, watch: ?*Watch) ![]u8 {
@@ -459,7 +416,7 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
     // driven here instead, and the socket's error is returned as it is.
     const uri = try std.Uri.parse(url);
     connect.last_note = .{};
-    const conn = try connectTo(client, uri);
+    const conn = try connect.open(client, uri);
     var req = try client.request(.GET, uri, .{
         .connection = conn,
         .redirect_behavior = @enumFromInt(3),
