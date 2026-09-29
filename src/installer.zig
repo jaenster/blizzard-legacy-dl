@@ -12,6 +12,7 @@ const std = @import("std");
 const watch_mod = @import("watch");
 pub const legacy = @import("legacy");
 const libd2 = @import("libd2");
+pub const stubfetch = @import("stubfetch.zig");
 const mpq = libd2.formats.mpq;
 const script = libd2.formats.installer;
 const ptc = libd2.formats.ptc;
@@ -143,6 +144,22 @@ pub const Error = error{
     NoSuchVersion,
     /// Neither a file nor a product Blizzard would hand a stub for.
     NoStub,
+    /// Blizzard, or something in front of it, refused this network or region (401, 403, 451).
+    Blocked,
+    /// Blizzard answered 429, and kept answering it.
+    RateLimited,
+    /// Blizzard answered 200 with nothing, the way it rate-limits, and kept doing so.
+    EmptyAnswer,
+    /// An HTML page came back where the downloader should be: a proxy, a portal, a block page.
+    NotADownloader,
+    /// Big enough to be a downloader but with no install data in it.
+    BadStub,
+    /// Blizzard's server answered 5xx, and kept doing so.
+    BlizzardServerError,
+    /// The redirects never ended.
+    RedirectLoop,
+    /// The patch server (the caller's, not Blizzard's) did not deliver the patch after every retry.
+    PatchServerFailed,
     /// The payload carries no Installer Tome.
     NoTome,
     /// The payload's Tome carries no install script.
@@ -375,6 +392,8 @@ fn fileExists(io: std.Io, dir: []const u8, name: []const u8) bool {
 
 /// The status of the last failed fetch, so a piece failure can say 403 rather than "HttpStatus".
 pub threadlocal var last_status: u16 = 0;
+/// What the last request on this thread came back with (stubfetch.zig).
+pub threadlocal var last_fetch: stubfetch.Diag = .{};
 
 /// GET a URL whole. `cookie` is the CDN access token, sent on every piece request.
 pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8) ![]u8 {
@@ -384,6 +403,7 @@ pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u
 /// `fetchUrl`, with the connection handed to `watch` once it is open, so the watchdog can shut it
 /// down when the attempt runs past its deadline.
 fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, watch: ?*Watch) ![]u8 {
+    last_fetch.reset();
     // `Pragma: no-cache` is not the program's doing: the client opens every request with
     // INTERNET_FLAG_RELOAD, and that is what WinInet puts on the wire for it.
     const with_cookie = [_]std.http.Header{
@@ -407,10 +427,13 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
 
     var redirect_buffer: [8 * 1024]u8 = undefined;
     var res = try req.receiveHead(&redirect_buffer);
-    if (res.head.status != .ok and res.head.status != .partial_content) {
-        last_status = @intFromEnum(res.head.status);
-        return error.HttpStatus;
-    }
+    // Kept for the log line of a failure: what came back, from where, and how it opened.
+    var final_url: [stubfetch.Diag.url_cap]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&final_url);
+    req.uri.format(&fw) catch {};
+    last_fetch.setResponse(@intFromEnum(res.head.status), res.head.content_type, fw.buffered());
+    const ok_status = res.head.status == .ok or res.head.status == .partial_content;
+    if (!ok_status) last_status = @intFromEnum(res.head.status);
     // The CDN compresses when asked, and the client asks by default; undone here as fetch does.
     const decompress_buffer: []u8 = switch (res.head.content_encoding) {
         .identity => &.{},
@@ -420,10 +443,18 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
     };
     defer gpa.free(decompress_buffer);
 
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    errdefer body.deinit();
     var transfer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
+    if (!ok_status) {
+        // A refusal's body says why (a block page, a rate-limit notice); the start of it goes in the log.
+        var peek: [stubfetch.Diag.head_cap]u8 = undefined;
+        const n = res.readerDecompressing(&transfer, &decompress, decompress_buffer).readSliceShort(&peek) catch 0;
+        last_fetch.setBody(peek[0..n], n);
+        return error.HttpStatus;
+    }
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    errdefer body.deinit();
     _ = res.readerDecompressing(&transfer, &decompress, decompress_buffer).streamRemaining(&body.writer) catch |err| switch (err) {
         error.ReadFailed => {
             if (res.bodyErr()) |e| return e;
@@ -432,6 +463,7 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
         },
         error.WriteFailed => return error.OutOfMemory,
     };
+    last_fetch.setBody(body.written()[0..@min(body.written().len, stubfetch.Diag.head_cap)], body.written().len);
     return body.toOwnedSlice();
 }
 
@@ -454,17 +486,63 @@ pub fn resolveStub(
         getlegacy, code.items, locale, os_,
     });
     defer gpa.free(url);
-    const body = fetchUrl(gpa, client, url, null) catch {
-        if (rep) |r| r.say(.resolving, "no file '{s}', and fetching product {s} failed\n", .{ arg, code.items });
-        return error.NoStub;
-    };
-    // The endpoint answers 200 with nothing when it is rate-limiting, so size is the real check.
-    if (body.len < 1024) {
-        gpa.free(body);
-        if (rep) |r| r.say(.resolving, "product {s} ({s}, {s}) returned nothing — unknown product, or you are being rate-limited\n", .{ code.items, locale, os_ });
-        return error.NoStub;
+
+    // The endpoint rate-limits by answering with nothing, so an empty or refused answer is asked
+    // again after a pause; a page where the downloader should be is not (it will be the same page).
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        if (attempt > 0) {
+            const wait = stubfetch.backoffSeconds(attempt);
+            if (rep) |r| r.say(.resolving, "asking Blizzard for {s} again in {d} s (attempt {d} of {d})\n", .{ code.items, wait, attempt + 1, stubfetch.attempts });
+            std.Io.sleep(io, .fromSeconds(@intCast(wait)), .awake) catch {};
+        }
+        const last_try = attempt + 1 >= stubfetch.attempts;
+        var shown: [400]u8 = undefined;
+
+        const got = fetchUrl(gpa, client, url, null);
+        if (got) |body| {
+            var v = stubfetch.classify(200, last_fetch.contentType(), body[0..@min(body.len, 64)], body.len);
+            if (v == .ok) {
+                if (legacy.fromStub(gpa, body)) |_| {
+                    return body;
+                } else |_| v = .bad_stub;
+            }
+            gpa.free(body);
+            if (rep) |r| r.say(.resolving, "product {s} ({s}, {s}): {s}: {s}\n", .{ code.items, locale, os_, v.label(), last_fetch.describe(&shown) });
+            if (v.transient() and !last_try) continue;
+            return stubError(v);
+        } else |e| {
+            // Not an answer at all: the network's own failure keeps its name, so the caller can say what it was.
+            const v: ?stubfetch.Verdict = switch (e) {
+                error.HttpStatus => stubfetch.classify(last_fetch.status, last_fetch.contentType(), last_fetch.headBytes(), last_fetch.body_len),
+                error.TooManyHttpRedirects => .redirect_loop,
+                else => null,
+            };
+            if (rep) |r| {
+                if (v) |vv|
+                    r.say(.resolving, "product {s} ({s}, {s}): {s}: {s}\n", .{ code.items, locale, os_, vv.label(), last_fetch.describe(&shown) })
+                else
+                    r.say(.resolving, "product {s} ({s}, {s}): the request failed: {t}\n", .{ code.items, locale, os_, e });
+            }
+            if (!last_try and (v == null or v.?.transient())) continue;
+            return if (v) |vv| stubError(vv) else e;
+        }
     }
-    return body;
+}
+
+/// The error a verdict on the stub request stands for.
+pub fn stubError(v: stubfetch.Verdict) Error {
+    return switch (v) {
+        .ok => unreachable,
+        .blocked => error.Blocked,
+        .rate_limited => error.RateLimited,
+        .empty => error.EmptyAnswer,
+        .web_page => error.NotADownloader,
+        .bad_stub => error.BadStub,
+        .server_error => error.BlizzardServerError,
+        .redirect_loop => error.RedirectLoop,
+        .not_found, .unexpected_status => error.NoStub,
+    };
 }
 
 // ── fetching ───────────────────────────────────────────────────────────────────────────────────
@@ -1134,9 +1212,25 @@ fn patchTo(
     rep.set(.patching, 0, 0, url);
     rep.say(.patching, "\npatching to {s}\n  {s}\n", .{ version, url });
 
-    const exe = fetchUrl(gpa, client, url, null) catch |e| {
-        rep.say(.patching, "  no patch archive for {s} ({t})\n", .{ version, e });
-        return error.NoSuchVersion;
+    // Only a 404 means the version is not on offer; anything else is the patch server having a bad moment.
+    var attempt: usize = 0;
+    const exe = while (true) : (attempt += 1) {
+        if (attempt > 0) {
+            const wait = stubfetch.backoffSeconds(attempt);
+            rep.say(.patching, "  asking for the patch again in {d} s (attempt {d} of {d})\n", .{ wait, attempt + 1, stubfetch.attempts });
+            std.Io.sleep(io, .fromSeconds(@intCast(wait)), .awake) catch {};
+            try checkpoint(io, control);
+        }
+        if (fetchUrl(gpa, client, url, null)) |bytes| break bytes else |e| {
+            var shown: [400]u8 = undefined;
+            const status: u16 = if (e == error.HttpStatus) last_fetch.status else 0;
+            if (status != 0)
+                rep.say(.patching, "  patch server for {s}: {s}\n", .{ version, last_fetch.describe(&shown) })
+            else
+                rep.say(.patching, "  patch server for {s}: the request failed: {t}\n", .{ version, e });
+            if (status == 404 or status == 410) return error.NoSuchVersion;
+            if (attempt + 1 >= stubfetch.attempts) return error.PatchServerFailed;
+        }
     };
     try checkpoint(io, control);
     var patch = try mpq.Archive.open(gpa, exe);
@@ -1417,4 +1511,8 @@ test "only an (attributes) the old Storm.dll cannot use is unlisted, and nothing
         const table_end = table_at + arc.hashes.len * 16;
         try std.testing.expectEqualSlices(u8, before[table_end..], built[table_end..]);
     }
+}
+
+test {
+    _ = stubfetch;
 }
