@@ -13,6 +13,7 @@ const watch_mod = @import("watch");
 pub const legacy = @import("legacy");
 const libd2 = @import("libd2");
 pub const stubfetch = @import("stubfetch.zig");
+pub const connect = @import("connect.zig");
 const mpq = libd2.formats.mpq;
 const script = libd2.formats.installer;
 const ptc = libd2.formats.ptc;
@@ -400,6 +401,49 @@ pub fn fetchUrl(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u
     return fetchUrlWatched(gpa, client, url, cookie, null);
 }
 
+/// A connection to `uri`'s host: one the client already holds, else one to whichever of the host's addresses
+/// answers first (connect.zig), verified as the host itself.
+fn connectTo(client: *std.http.Client, uri: std.Uri) !*std.http.Client.Connection {
+    const io = client.io;
+    var name_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&name_buf);
+    const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
+    // The certificate roots, loaded once per client, as `Client.request` does before it connects.
+    if (protocol == .tls) tls: {
+        {
+            try client.ca_bundle_lock.lockShared(io);
+            defer client.ca_bundle_lock.unlockShared(io);
+            if (client.now != null) break :tls;
+        }
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const now = std.Io.Clock.real.now(io);
+        bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => return error.CertificateBundleLoadFailure,
+        };
+        try client.ca_bundle_lock.lock(io);
+        defer client.ca_bundle_lock.unlock(io);
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    }
+    const port = uri.port orelse @as(u16, if (protocol == .tls) 443 else 80);
+    if (client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return c;
+    var found: [32]std.Io.net.IpAddress = undefined;
+    const addrs = try connect.resolve(io, host.bytes, port, &found);
+    // One address leaves nothing to choose between: the ordinary connect.
+    if (addrs.len == 1) return client.connectTcpOptions(.{ .host = host, .port = port, .protocol = protocol });
+    const winner = try connect.race(io, addrs, connect.stagger_ms, connect.give_up_ms);
+    var lit: [64]u8 = undefined;
+    return client.connectTcpOptions(.{
+        .host = .{ .bytes = connect.literal(winner, &lit) },
+        .port = port,
+        .protocol = protocol,
+        .proxied_host = host,
+        .proxied_port = port,
+    });
+}
+
 /// `fetchUrl`, with the connection handed to `watch` once it is open, so the watchdog can shut it
 /// down when the attempt runs past its deadline.
 fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []const u8, cookie: ?[]const u8, watch: ?*Watch) ![]u8 {
@@ -413,7 +457,11 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
     // Not `client.fetch`: when a body read fails for a reason of the socket's own (a cancelled read,
     // a reset), fetch unwraps an HTTP-level error that was never set and panics. The request is
     // driven here instead, and the socket's error is returned as it is.
-    var req = try client.request(.GET, try std.Uri.parse(url), .{
+    const uri = try std.Uri.parse(url);
+    connect.last_note = .{};
+    const conn = try connectTo(client, uri);
+    var req = try client.request(.GET, uri, .{
+        .connection = conn,
         .redirect_behavior = @enumFromInt(3),
         .headers = .{ .user_agent = .{ .override = legacy.user_agent } },
         .extra_headers = if (cookie != null) &with_cookie else &.{
@@ -467,6 +515,14 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
     return body.toOwnedSlice();
 }
 
+/// The last response's log line, and how each address of the host fared when it had to be chosen between.
+fn evidence(buf: []u8) []const u8 {
+    const head = last_fetch.describe(buf[0..@min(buf.len, 400)]);
+    const note = connect.last_note.text();
+    if (note.len == 0) return head;
+    return std.fmt.bufPrint(buf, "{s} [connect: {s}]", .{ head, std.mem.trimEnd(u8, note, "; ") }) catch head;
+}
+
 /// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
 pub fn resolveStub(
     gpa: std.mem.Allocator,
@@ -497,18 +553,19 @@ pub fn resolveStub(
             std.Io.sleep(io, .fromSeconds(@intCast(wait)), .awake) catch {};
         }
         const last_try = attempt + 1 >= stubfetch.attempts;
-        var shown: [400]u8 = undefined;
+        var shown: [900]u8 = undefined;
 
         const got = fetchUrl(gpa, client, url, null);
         if (got) |body| {
             var v = stubfetch.classify(200, last_fetch.contentType(), body[0..@min(body.len, 64)], body.len);
             if (v == .ok) {
                 if (legacy.fromStub(gpa, body)) |_| {
+                    if (connect.last_note.trouble) if (rep) |r| r.say(.resolving, "connecting to Blizzard: {s}\n", .{connect.last_note.text()});
                     return body;
                 } else |_| v = .bad_stub;
             }
             gpa.free(body);
-            if (rep) |r| r.say(.resolving, "product {s} ({s}, {s}): {s}: {s}\n", .{ code.items, locale, os_, v.label(), last_fetch.describe(&shown) });
+            if (rep) |r| r.say(.resolving, "product {s} ({s}, {s}): {s}: {s}\n", .{ code.items, locale, os_, v.label(), evidence(&shown) });
             if (v.transient() and !last_try) continue;
             return stubError(v);
         } else |e| {
@@ -520,9 +577,9 @@ pub fn resolveStub(
             };
             if (rep) |r| {
                 if (v) |vv|
-                    r.say(.resolving, "product {s} ({s}, {s}): {s}: {s}\n", .{ code.items, locale, os_, vv.label(), last_fetch.describe(&shown) })
+                    r.say(.resolving, "product {s} ({s}, {s}): {s}: {s}\n", .{ code.items, locale, os_, vv.label(), evidence(&shown) })
                 else
-                    r.say(.resolving, "product {s} ({s}, {s}): the request failed: {t}\n", .{ code.items, locale, os_, e });
+                    r.say(.resolving, "product {s} ({s}, {s}): the request failed: {t} [connect: {s}]\n", .{ code.items, locale, os_, e, connect.last_note.text() });
             }
             if (!last_try and (v == null or v.?.transient())) continue;
             return if (v) |vv| stubError(vv) else e;
@@ -1222,12 +1279,12 @@ fn patchTo(
             try checkpoint(io, control);
         }
         if (fetchUrl(gpa, client, url, null)) |bytes| break bytes else |e| {
-            var shown: [400]u8 = undefined;
+            var shown: [900]u8 = undefined;
             const status: u16 = if (e == error.HttpStatus) last_fetch.status else 0;
             if (status != 0)
-                rep.say(.patching, "  patch server for {s}: {s}\n", .{ version, last_fetch.describe(&shown) })
+                rep.say(.patching, "  patch server for {s}: {s}\n", .{ version, evidence(&shown) })
             else
-                rep.say(.patching, "  patch server for {s}: the request failed: {t}\n", .{ version, e });
+                rep.say(.patching, "  patch server for {s}: the request failed: {t} [connect: {s}]\n", .{ version, e, connect.last_note.text() });
             if (status == 404 or status == 410) return error.NoSuchVersion;
             if (attempt + 1 >= stubfetch.attempts) return error.PatchServerFailed;
         }
@@ -1515,4 +1572,5 @@ test "only an (attributes) the old Storm.dll cannot use is unlisted, and nothing
 
 test {
     _ = stubfetch;
+    _ = connect;
 }
