@@ -225,7 +225,19 @@ pub fn resolve(io: std.Io, host: []const u8, port: u16, out: []net.IpAddress) ![
 /// answers first, verified as the host itself (the address only says where to connect; the certificate and the
 /// Host header are the name's). Pass it as `RequestOptions.connection`, or use `warm` for a client that fetches.
 pub fn open(client: *std.http.Client, uri: std.Uri) !*std.http.Client.Connection {
+    return (try openTracked(client, uri)).connection;
+}
+
+/// A connection and whether it came out of the client's pool (one that had been idle) rather than being dialled now.
+pub const Opened = struct { connection: *std.http.Client.Connection, reused: bool };
+
+/// `open`, saying whether the connection was reused. Connections that sat idle for `idle_limit_ms` are dropped
+/// first: a server, a load balancer or a NAT closes those without a word, and the request that finds the dead
+/// one fails with HttpConnectionClosing.
+pub fn openTracked(client: *std.http.Client, uri: std.Uri) !Opened {
     const io = client.io;
+    if (idleExpired(client, io)) dropIdle(client);
+    touch(client, io);
     var name_buf: [net.HostName.max_len]u8 = undefined;
     const host = try uri.getHost(&name_buf);
     const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
@@ -249,27 +261,109 @@ pub fn open(client: *std.http.Client, uri: std.Uri) !*std.http.Client.Connection
         std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
     }
     const port = uri.port orelse @as(u16, if (protocol == .tls) 443 else 80);
-    if (client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return c;
+    if (client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return .{ .connection = c, .reused = true };
     var found: [32]net.IpAddress = undefined;
     const addrs = try resolve(io, host.bytes, port, &found);
     // One address leaves nothing to choose between: the ordinary connect.
-    if (addrs.len == 1) return client.connectTcpOptions(.{ .host = host, .port = port, .protocol = protocol });
+    if (addrs.len == 1) return .{ .connection = try client.connectTcpOptions(.{ .host = host, .port = port, .protocol = protocol }), .reused = false };
     const winner = try race(io, addrs, stagger_ms, give_up_ms);
     var lit: [64]u8 = undefined;
-    return client.connectTcpOptions(.{
+    return .{ .connection = try client.connectTcpOptions(.{
         .host = .{ .bytes = literal(winner, &lit) },
         .port = port,
         .protocol = protocol,
         .proxied_host = host,
         .proxied_port = port,
-    });
+    }), .reused = false };
 }
 
 /// Opens a connection to `url`'s host the way `open` does and leaves it in the client's pool, so the `fetch` or
 /// `request` that follows picks it up instead of connecting the standard way.
 pub fn warm(client: *std.http.Client, url: []const u8) !void {
-    const conn = try open(client, try std.Uri.parse(url));
-    client.connection_pool.release(conn, client.io);
+    _ = try warmTracked(client, try std.Uri.parse(url));
+}
+
+/// `warm`, saying whether the connection it left in the pool was an idle one reused.
+fn warmTracked(client: *std.http.Client, uri: std.Uri) !bool {
+    const o = try openTracked(client, uri);
+    client.connection_pool.release(o.connection, client.io);
+    return o.reused;
+}
+
+/// How long a pooled connection may sit idle before it is not trusted any more.
+pub var idle_limit_ms: i64 = 30_000;
+
+/// Requests that failed on a reused connection and went again on a fresh one.
+pub var stale_retries: std.atomic.Value(u32) = .init(0);
+
+// When each client last opened or finished a request, by address; a small table, since a program has a few clients.
+const activity_slots = 8;
+var activity_keys: [activity_slots]std.atomic.Value(usize) = @splat(.init(0));
+var activity_ms: [activity_slots]std.atomic.Value(i64) = @splat(.init(0));
+
+fn slotOf(client: *std.http.Client) usize {
+    const key = @intFromPtr(client);
+    for (&activity_keys, 0..) |*k, i| {
+        if (k.load(.acquire) == key) return i;
+    }
+    for (&activity_keys, 0..) |*k, i| {
+        if (k.cmpxchgStrong(0, key, .acq_rel, .acquire) == null) return i;
+    }
+    // Full: a slot is taken over; its client merely loses its history and is treated as fresh.
+    const i = (key >> 4) % activity_slots;
+    activity_keys[i].store(key, .release);
+    activity_ms[i].store(0, .release);
+    return i;
+}
+
+fn touch(client: *std.http.Client, io: std.Io) void {
+    activity_ms[slotOf(client)].store(nowMs(io), .release);
+}
+
+fn idleExpired(client: *std.http.Client, io: std.Io) bool {
+    const last = activity_ms[slotOf(client)].load(.acquire);
+    return last != 0 and nowMs(io) - last > idle_limit_ms;
+}
+
+/// Closes every connection the client holds idle in its pool, so the next request dials anew.
+pub fn dropIdle(client: *std.http.Client) void {
+    const io = client.io;
+    const pool = &client.connection_pool;
+    pool.mutex.lockUncancelable(io);
+    defer pool.mutex.unlock(io);
+    while (pool.free.popFirst()) |node| {
+        const c: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+        pool.free_len -= 1;
+        c.destroy(io);
+    }
+}
+
+/// A failure that says a reused connection was dead already: the server closed it while it sat idle.
+pub fn isStale(e: anyerror) bool {
+    return switch (e) {
+        error.HttpConnectionClosing, error.ConnectionResetByPeer, error.EndOfStream, error.BrokenPipe, error.ReadFailed, error.WriteFailed => true,
+        else => false,
+    };
+}
+
+/// `client.fetch` over `open`'s connection choice, with one retry: a request that fails the way a dead reused
+/// connection fails goes again on a fresh one, the idle ones dropped.
+pub fn fetch(client: *std.http.Client, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const reused = switch (options.location) {
+            .url => |u| try warmTracked(client, try std.Uri.parse(u)),
+            .uri => |u| try warmTracked(client, u),
+        };
+        if (client.fetch(options)) |r| {
+            touch(client, client.io);
+            return r;
+        } else |e| {
+            if (!reused or attempt > 0 or !isStale(e)) return e;
+            _ = stale_retries.fetchAdd(1, .monotonic);
+            dropIdle(client);
+        }
+    }
 }
 
 const testing = std.testing;
@@ -384,4 +478,116 @@ test "live: downloader.battle.net with a dead IPv6 and IPv4 address in front" {
     var buf: [64]u8 = undefined;
     const lit = literal(got, &buf);
     try testing.expect(!std.mem.eql(u8, lit, "100::1") and !std.mem.eql(u8, lit, "198.51.100.1"));
+}
+
+/// One connection at a time: answers each request on it once with a keep-alive answer, and closes after the first
+/// (a server, ingress or NAT that drops idle connections). Counts the connections and requests it saw.
+const TestServer = struct {
+    listener: net.Server,
+    connections: std.atomic.Value(u32) = .init(0),
+    requests: std.atomic.Value(u32) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn run(s: *TestServer) void {
+        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        while (!s.stop.load(.acquire)) {
+            const conn = s.listener.accept(io) catch return;
+            if (s.stop.load(.acquire)) {
+                conn.close(io);
+                return;
+            }
+            _ = s.connections.fetchAdd(1, .monotonic);
+            var rbuf: [2048]u8 = undefined;
+            var wbuf: [512]u8 = undefined;
+            var r = conn.reader(io, &rbuf);
+            var w = conn.writer(io, &wbuf);
+            while (true) {
+                const line = r.interface.takeDelimiterInclusive('\n') catch break;
+                if (!std.mem.eql(u8, std.mem.trimEnd(u8, line, "\r\n"), "")) continue;
+                _ = s.requests.fetchAdd(1, .monotonic);
+                w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok") catch break;
+                w.interface.flush() catch break;
+                break; // the connection is closed after its first answer
+            }
+            conn.close(io);
+        }
+    }
+};
+
+fn testGet(client: *std.http.Client, url: []const u8) !void {
+    var body: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&body);
+    const res = try fetch(client, .{ .location = .{ .url = url }, .response_writer = &w });
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expectEqualStrings("ok", w.buffered());
+}
+
+test "a keep-alive connection the server closed while idle is retried once on a fresh one" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var any: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server: TestServer = .{ .listener = try any.listen(io, .{}) };
+    const port = server.listener.socket.address.ip4.port;
+    const t = try std.Thread.spawn(.{}, TestServer.run, .{&server});
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+    const saved = idle_limit_ms;
+    idle_limit_ms = 60_000;
+    defer idle_limit_ms = saved;
+    const before = stale_retries.load(.monotonic);
+
+    try testGet(&client, url);
+    // The pause: the server's close has long arrived, the pool still holds the connection.
+    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
+    try testGet(&client, url);
+
+    try testing.expectEqual(before + 1, stale_retries.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), server.connections.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), server.requests.load(.monotonic));
+
+    server.stop.store(true, .release);
+    var wake = server.listener.socket.address;
+    if (wake.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+    t.join();
+    server.listener.deinit(io);
+}
+
+test "a connection idle past the limit is not reused, so nothing needs a retry" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var any: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server: TestServer = .{ .listener = try any.listen(io, .{}) };
+    const port = server.listener.socket.address.ip4.port;
+    const t = try std.Thread.spawn(.{}, TestServer.run, .{&server});
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+    const saved = idle_limit_ms;
+    idle_limit_ms = 50;
+    defer idle_limit_ms = saved;
+    const before = stale_retries.load(.monotonic);
+
+    try testGet(&client, url);
+    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
+    try testGet(&client, url);
+
+    try testing.expectEqual(before, stale_retries.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), server.connections.load(.monotonic));
+
+    server.stop.store(true, .release);
+    var wake = server.listener.socket.address;
+    if (wake.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+    t.join();
+    server.listener.deinit(io);
 }
