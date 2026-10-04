@@ -972,21 +972,48 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
         const dest = try zpath(arena, &.{ dir_path, meta.name });
         try preallocate(arena, io, meta, dest);
 
-        const got = try fetchPayload(arena, io, meta, dest, .{
-            .first = opts.first_piece,
-            .last = opts.last_piece,
-            .retries = opts.retries,
-            .jobs = opts.jobs,
-            .sequential = opts.sequential,
-            .cookie = cookie,
-            .control = opts.control,
-            .label = dir_path,
-        }, &rep);
-        if (got.failed != 0) return error.Incomplete;
+        // A CDN that stalls for a minute fails a handful of pieces; those are asked for again, on the
+        // pieces already on disk, before the whole install is called incomplete.
+        var round: usize = 0;
+        var before: usize = std.math.maxInt(usize);
+        while (true) : (round += 1) {
+            const got = try fetchPayload(arena, io, meta, dest, .{
+                .first = opts.first_piece,
+                .last = opts.last_piece,
+                .retries = opts.retries,
+                .jobs = opts.jobs,
+                .sequential = opts.sequential,
+                .cookie = cookie,
+                .control = opts.control,
+                .label = dir_path,
+            }, &rep);
+            if (got.failed == 0) break;
+            if (!another_round(round, before, got.failed)) return error.Incomplete;
+            before = got.failed;
+            rep.say(.downloading, "\n{d} pieces did not arrive; asking for them again\n", .{got.failed});
+            std.Io.sleep(io, .fromMilliseconds(round_pause_ms * @as(i64, @intCast(round + 1))), .awake) catch {};
+        }
 
         try installPayload(arena, gpa, io, &rep, &client, opts, dest, game_root, if (pass + 1 == targets.len) opts.version else null);
     }
     rep.set(.done, 1, 1, game_root);
+}
+
+/// Rounds of the whole fetch an install makes after the first, and the pause before each (times its number).
+pub const max_extra_rounds: usize = 3;
+const round_pause_ms: i64 = 2000;
+
+/// Whether to fetch the missing pieces once more: not past the round limit, and not when the last round
+/// got no piece further (the pieces that remain are refused, not merely slow).
+fn another_round(round: usize, failed_before: usize, failed_now: usize) bool {
+    return round < max_extra_rounds and failed_now < failed_before;
+}
+
+test "missing pieces are asked for again while each round gets some further" {
+    try std.testing.expect(another_round(0, std.math.maxInt(usize), 18));
+    try std.testing.expect(another_round(1, 18, 5));
+    try std.testing.expect(!another_round(1, 18, 18));
+    try std.testing.expect(!another_round(max_extra_rounds, 9, 3));
 }
 
 /// The archives an install lays down, in the order the game searches them. `patch_d2.mpq` is not
