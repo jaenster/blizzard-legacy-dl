@@ -95,6 +95,7 @@ verify  <stub> [-o dir]            re-check an assembled payload against its pie
 run     <stub> [-o dir]            the full downloader sequence, printed step by step
 install <stub> [--game dir]        fetch, then build a playable game directory
 stubs   -o <dir>                   download every product/locale/os stub there is
+mirror  <product> -o <dir>         copy a payload from Blizzard into a directory to serve as a mirror
 proxy   [--port n]                 log HTTP requests passing through, and forward them
 ```
 
@@ -178,6 +179,29 @@ So **ask for a product code and it just works** — that fetches a fresh stub wi
 An old stub on disk may have expired, and an expired token cannot be renewed locally: get a new
 stub. A bare `.torrent` carries no token at all; use `--cookie`, or `--base` to point somewhere
 that does not check.
+
+`--mirror <url>` adds a mirror to the servers the stub names instead of replacing them.
+
+## Mirroring a payload
+
+`mirror <product> -o <dir>` downloads every piece of a payload from Blizzard, checks each against
+its SHA-1, and writes them under the same path Blizzard serves them from, with the torrent next
+to them as `metainfo.torrent`:
+
+    <dir>/applications/Diablo2/1.14B/LOD/enUS/0 … 2038
+    <dir>/applications/Diablo2/1.14B/LOD/enUS/metainfo.torrent
+
+Put that directory behind any web server (a bucket will do) and pass its root as
+`--mirror https://host`. Each server the torrent names is looked for on the mirror under the same
+path. The mirror is asked after Blizzard's servers, and first once Blizzard's servers have failed
+more often than they delivered; a request to a server that has a mirror behind it gives up after
+15 s instead of 60 s. Pieces from a mirror are checked against the torrent's hashes like any
+other, so a mirror cannot hand out altered data. The CDN access token is never sent to a mirror.
+
+Re-running `mirror` into the same directory keeps the pieces already there that still match.
+The `metainfo.torrent` it writes is what `src/meta/` keeps: the torrents for D2DV and D2XP (en-US, WIN)
+are compiled into the library, and `install` uses them when it has a mirror and Blizzard will not
+hand out the stub, so an install does not depend on Blizzard being reachable at all.
 
 ## How the payload is served
 

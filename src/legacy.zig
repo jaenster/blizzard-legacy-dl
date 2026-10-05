@@ -148,6 +148,9 @@ pub const Server = struct {
     url: []const u8,
     first: u64 = 0,
     last: u64 = std.math.maxInt(u64),
+    /// A host that carries a copy of the pieces under the same path (see `Metainfo.addMirrors`)
+    /// rather than one the torrent names. It is not sent the CDN access token.
+    mirror: bool = false,
 
     pub fn covers(self: Server, index: usize) bool {
         return index >= self.first and index <= self.last;
@@ -201,6 +204,29 @@ pub fn expandServerUrls(gpa: std.mem.Allocator, spec: []const u8, out: *std.Arra
             }
         }
     }
+}
+
+/// One piece request: the URL, and whether it goes to a mirror.
+pub const Target = struct { url: []u8, mirror: bool };
+
+/// The path of a URL, from the first `/` after the host, without a trailing slash.
+pub fn urlPath(url: []const u8) []const u8 {
+    const after = if (std.mem.indexOf(u8, url, "://")) |i| i + 3 else 0;
+    const at = std.mem.indexOfScalarPos(u8, url, after, '/') orelse return "";
+    return std.mem.trimEnd(u8, url[at..], "/");
+}
+
+/// Where a mirror keeps the metainfo of a payload, next to its pieces.
+pub const metainfo_name = "metainfo.torrent";
+
+/// The metainfo of a payload, compiled in: the piece hashes of what `mirror` wrote, so a payload
+/// can be fetched and checked without asking Blizzard for anything. Only the products below, for
+/// en-US on Windows.
+pub fn embedded(product: []const u8, locale: []const u8, os: []const u8) ?[]const u8 {
+    if (!std.ascii.eqlIgnoreCase(locale, "en-US") or !std.ascii.eqlIgnoreCase(os, "WIN")) return null;
+    if (std.ascii.eqlIgnoreCase(product, "D2DV")) return @embedFile("meta/D2DV-en-US-WIN.torrent");
+    if (std.ascii.eqlIgnoreCase(product, "D2XP")) return @embedFile("meta/D2XP-en-US-WIN.torrent");
+    return null;
 }
 
 pub const Metainfo = struct {
@@ -270,6 +296,71 @@ pub const Metainfo = struct {
             std.fmt.allocPrint(gpa, "{s}/{d}?{s}", .{ base, index, s })
         else
             std.fmt.allocPrint(gpa, "{s}/{d}", .{ base, index });
+    }
+
+    /// Add mirrors: `roots` is one or more host roots (`https://host` or `https://host/prefix`)
+    /// separated by `|`. Every server the torrent names is copied onto each root under the same
+    /// path, so `http://cdn/applications/x/enUS` is also looked for at `<root>/applications/x/enUS`.
+    /// The mirrors come after the torrent's own servers, covering the same pieces.
+    pub fn addMirrors(self: *Metainfo, gpa: std.mem.Allocator, roots: []const u8) !void {
+        var out: std.ArrayList(Server) = .empty;
+        try out.appendSlice(gpa, self.servers);
+        var rs = std.mem.splitScalar(u8, roots, '|');
+        while (rs.next()) |raw| {
+            const root = std.mem.trimEnd(u8, raw, "/");
+            if (root.len == 0) continue;
+            for (self.servers) |s| {
+                if (s.mirror) continue;
+                const path = urlPath(s.url);
+                const url = try std.fmt.allocPrint(gpa, "{s}{s}", .{ root, path });
+                var dup = false;
+                for (out.items) |o| {
+                    if (std.mem.eql(u8, o.url, url) and o.first == s.first and o.last == s.last) dup = true;
+                }
+                if (dup) {
+                    gpa.free(url);
+                    continue;
+                }
+                try out.append(gpa, .{ .url = url, .first = s.first, .last = s.last, .mirror = true });
+            }
+        }
+        self.servers = try out.toOwnedSlice(gpa);
+    }
+
+    /// Whether any mirror covers `index`.
+    pub fn hasMirror(self: Metainfo, index: usize) bool {
+        for (self.servers) |s| if (s.mirror and s.covers(index)) return true;
+        return false;
+    }
+
+    /// Where to ask for piece `index` on try number `attempt`: the servers that cover it in turn,
+    /// the torrent's own first, or the mirrors first when `mirrors_first`. Tries beyond the number
+    /// of servers go round again.
+    pub fn pieceTarget(self: Metainfo, gpa: std.mem.Allocator, index: usize, salt: ?[]const u8, attempt: usize, mirrors_first: bool) !Target {
+        var n: usize = 0;
+        for (self.servers) |s| {
+            if (s.covers(index)) n += 1;
+        }
+        if (n == 0) return .{ .url = try self.pieceUrlFrom(gpa, index, salt, 0), .mirror = false };
+        var want = attempt % n;
+        const firsts = [2]bool{ mirrors_first, !mirrors_first };
+        for (firsts) |m| {
+            for (self.servers) |s| {
+                if (!s.covers(index) or s.mirror != m) continue;
+                if (want != 0) {
+                    want -= 1;
+                    continue;
+                }
+                const base = std.mem.trimEnd(u8, s.url, "/");
+                // The cache-buster is for Blizzard's CDN; a mirror is served as is.
+                const url = if (salt != null and !s.mirror)
+                    try std.fmt.allocPrint(gpa, "{s}/{d}?{s}", .{ base, index, salt.? })
+                else
+                    try std.fmt.allocPrint(gpa, "{s}/{d}", .{ base, index });
+                return .{ .url = url, .mirror = s.mirror };
+            }
+        }
+        unreachable;
     }
 
     pub fn verify(self: Metainfo, index: usize, data: []const u8) Error!void {
@@ -703,4 +794,69 @@ test "a tracker refusal is reported, not mistaken for success" {
     const r = try parseAnnounce(arena.allocator(), "d14:failure reason9:no such te");
     try testing.expectEqualStrings("no such t", r.failure.?);
     try testing.expectEqual(@as(usize, 0), r.servers.len);
+}
+
+test "a mirror is the same path under another host, after the servers the torrent names" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = [_]Server{.{ .url = "http://cdn.example/apps/x/enUS" }};
+    var meta: Metainfo = undefined;
+    meta.servers = &servers;
+    try meta.addMirrors(arena, "https://m1.example/|https://m2.example/pre");
+    try std.testing.expectEqual(@as(usize, 3), meta.servers.len);
+    try std.testing.expectEqualStrings("https://m1.example/apps/x/enUS", meta.servers[1].url);
+    try std.testing.expectEqualStrings("https://m2.example/pre/apps/x/enUS", meta.servers[2].url);
+    try std.testing.expect(!meta.servers[0].mirror and meta.servers[1].mirror and meta.servers[2].mirror);
+    try std.testing.expect(meta.hasMirror(5));
+
+    // Blizzard first, then each mirror, then round again.
+    const order = [_][]const u8{ "http://cdn.example/apps/x/enUS/7", "https://m1.example/apps/x/enUS/7", "https://m2.example/pre/apps/x/enUS/7", "http://cdn.example/apps/x/enUS/7?salt" };
+    for (order, 0..) |want, attempt| {
+        const t = try meta.pieceTarget(arena, 7, if (attempt == 3) "salt" else null, attempt, false);
+        try std.testing.expectEqualStrings(want, t.url);
+        try std.testing.expectEqual(attempt == 1 or attempt == 2, t.mirror);
+    }
+    // Mirrors first, and no cache-buster on a mirror.
+    const t = try meta.pieceTarget(arena, 7, "salt", 0, true);
+    try std.testing.expectEqualStrings("https://m1.example/apps/x/enUS/7", t.url);
+    try std.testing.expect(t.mirror);
+}
+
+test "a mirror covers the same pieces as the server it copies" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var servers = [_]Server{
+        .{ .url = "http://a/all" },
+        .{ .url = "http://b/part", .first = 10, .last = 19 },
+    };
+    var meta: Metainfo = undefined;
+    meta.servers = &servers;
+    try meta.addMirrors(arena, "https://m");
+    try std.testing.expect(!meta.hasMirror(100) or std.mem.eql(u8, meta.servers[2].url, "https://m/all"));
+    const t = try meta.pieceTarget(arena, 15, null, 1, false);
+    try std.testing.expectEqualStrings("http://b/part/15", t.url);
+    try std.testing.expectEqualStrings("", urlPath("http://host"));
+    try std.testing.expectEqualStrings("/a/b", urlPath("http://host/a/b/"));
+}
+
+test "the compiled-in metainfo reads like a stub and carries every piece hash" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const want = [_]struct { product: []const u8, pieces: usize }{ .{ .product = "D2DV", .pieces = 6088 }, .{ .product = "d2xp", .pieces = 2039 } };
+    for (want) |w| {
+        const bytes = embedded(w.product, "en-US", "WIN").?;
+        const meta = try fromStub(arena, bytes);
+        try std.testing.expectEqual(w.pieces, meta.pieceCount());
+        try std.testing.expect(meta.token == null);
+        try std.testing.expect(meta.servers.len == 1);
+    }
+    try std.testing.expect(embedded("D2DV", "de-DE", "WIN") == null);
+    try std.testing.expect(embedded("STAR", "en-US", "WIN") == null);
 }

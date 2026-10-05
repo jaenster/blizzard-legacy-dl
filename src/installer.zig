@@ -131,6 +131,12 @@ pub const Options = struct {
     language: []const u8 = "English",
     /// Fetch pieces from this mirror instead of the servers the stub names.
     base_url: ?[]const u8 = null,
+    /// Hosts that keep a copy of the pieces under the same path as the torrent's own servers
+    /// (`https://host`, several separated by `|`). Unlike `base_url` they are added to the servers
+    /// the stub names, and a piece Blizzard does not deliver is asked for there. A payload whose
+    /// stub Blizzard will not hand out is read from the metainfo compiled into the library, when
+    /// there is one, and fetched from these first.
+    mirrors: []const u8 = "",
     /// Override the CDN access token taken from the stub.
     cookie: ?[]const u8 = null,
     retries: usize = 3,
@@ -490,6 +496,20 @@ pub fn resolveStub(
     os_: []const u8,
     rep: ?*Reporter,
 ) ![]u8 {
+    return resolveStubTries(gpa, io, client, arg, locale, os_, rep, stubfetch.attempts);
+}
+
+/// `resolveStub`, asking Blizzard at most `tries` times.
+fn resolveStubTries(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    client: *std.http.Client,
+    arg: []const u8,
+    locale: []const u8,
+    os_: []const u8,
+    rep: ?*Reporter,
+    tries: usize,
+) ![]u8 {
     if (readFile(gpa, io, arg)) |bytes| return bytes else |_| {}
 
     var code: std.ArrayList(u8) = .empty;
@@ -506,10 +526,10 @@ pub fn resolveStub(
     while (true) : (attempt += 1) {
         if (attempt > 0) {
             const wait = stubfetch.backoffSeconds(attempt);
-            if (rep) |r| r.say(.resolving, "asking Blizzard for {s} again in {d} s (attempt {d} of {d})\n", .{ code.items, wait, attempt + 1, stubfetch.attempts });
+            if (rep) |r| r.say(.resolving, "asking Blizzard for {s} again in {d} s (attempt {d} of {d})\n", .{ code.items, wait, attempt + 1, tries });
             std.Io.sleep(io, .fromSeconds(@intCast(wait)), .awake) catch {};
         }
-        const last_try = attempt + 1 >= stubfetch.attempts;
+        const last_try = attempt + 1 >= tries;
         var shown: [900]u8 = undefined;
 
         const got = fetchUrl(gpa, client, url, null);
@@ -615,6 +635,12 @@ pub const FetchOptions = struct {
     label: []const u8 = "",
     /// How long one piece's request may take before it is abandoned and tried again.
     piece_timeout_ms: u64 = piece_timeout_ms,
+    /// How long a request to a server the torrent names may take when a mirror could answer instead.
+    primary_timeout_ms: u64 = primary_timeout_ms,
+    /// Ask the mirrors before the torrent's own servers.
+    mirrors_first: bool = false,
+    /// Keep each piece as a file `<piece_dir>/<n>` instead of writing it into the payload.
+    piece_dir: ?[]const u8 = null,
 };
 
 pub const FetchResult = struct {
@@ -661,6 +687,9 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
         .rep = rep,
         .total = total,
         .timeout_ms = opts.piece_timeout_ms,
+        .primary_timeout_ms = @min(opts.primary_timeout_ms, opts.piece_timeout_ms),
+        .mirrors_first = opts.mirrors_first,
+        .piece_dir = opts.piece_dir,
     };
     {
         rep.acquire();
@@ -685,9 +714,12 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
 
     const res: FetchResult = .{ .done = shared.done, .resumed = shared.resumed, .failed = shared.failed };
     if (shared.gave_up) {
-        rep.say(.downloading, "\n{d} pieces failed and none succeeded.\n" ++
-            "A 403 here usually means the stub's access token has expired; fetch a fresh\n" ++
-            "stub by asking for the product code, or pass --cookie. See the README.\n", .{res.failed});
+        if (meta.hasMirror(opts.first))
+            rep.say(.downloading, "\n{d} pieces failed and none succeeded, from Blizzard's servers and from the mirror.\n", .{res.failed})
+        else
+            rep.say(.downloading, "\n{d} pieces failed and none succeeded.\n" ++
+                "A 403 here usually means the stub's access token has expired; fetch a fresh\n" ++
+                "stub by asking for the product code, or pass --cookie. See the README.\n", .{res.failed});
         return error.AllPiecesFailed;
     }
     if (res.resumed != 0)
@@ -700,6 +732,14 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
 /// How long one piece (256 KiB) may take before its request is abandoned and tried again on a fresh connection.
 /// A CDN connection can stay open and send nothing; without a limit the whole download waits on it forever.
 pub const piece_timeout_ms: u64 = 60_000;
+
+/// The same for a server the torrent names when a mirror also covers the piece: a host that does not
+/// answer is given up on sooner, so the mirror gets the piece instead of a minute later.
+pub const primary_timeout_ms: u64 = 15_000;
+
+/// Failed requests to the torrent's own servers, with fewer pieces delivered than failures, after which
+/// the mirrors are asked first.
+const primary_give_up: usize = 3;
 
 /// A deadline for one request at a time, kept by a thread of its own (watch.zig).
 pub const Watch = watch_mod.Watch;
@@ -746,6 +786,12 @@ const Fetch = struct {
     rep: *Reporter,
     total: u64,
     timeout_ms: u64,
+    primary_timeout_ms: u64,
+    mirrors_first: bool,
+    piece_dir: ?[]const u8,
+    /// How the servers the torrent names have fared: pieces they delivered, and requests that failed.
+    primary_ok: usize = 0,
+    primary_bad: usize = 0,
 
     cursor: usize = 0,
     done: usize = 0,
@@ -753,6 +799,22 @@ const Fetch = struct {
     resumed: usize = 0,
     bytes: u64 = 0,
     gave_up: bool = false,
+
+    /// A piece already kept, wherever this fetch keeps them.
+    fn load(f: *Fetch, gpa: std.mem.Allocator, io: std.Io, index: usize, buf: []u8) ![]u8 {
+        const dir = f.piece_dir orelse return readPiece(f.meta, gpa, io, f.dest, index, buf);
+        const name = try std.fmt.allocPrint(gpa, "{s}/{d}", .{ dir, index });
+        const file = try openFile(io, name, .read_only);
+        defer file.close(io);
+        const n = try file.readPositionalAll(io, buf, 0);
+        return buf[0..n];
+    }
+
+    fn store(f: *Fetch, gpa: std.mem.Allocator, io: std.Io, index: usize, data: []const u8) !void {
+        const dir = f.piece_dir orelse return writePiece(f.meta, gpa, io, f.dest, index, data);
+        const name = try std.fmt.allocPrint(gpa, "{s}/{d}", .{ dir, index });
+        try writeWhole(io, name, data);
+    }
 
     fn take(f: *Fetch, io: std.Io) ?usize {
         checkpoint(io, f.control) catch return null;
@@ -791,7 +853,7 @@ const Fetch = struct {
             // Anything already on disk and matching its hash is left alone, so an interrupted
             // fetch resumes instead of downloading what it already has.
             if (scratch.alloc(u8, want)) |buf| {
-                if (readPiece(f.meta, scratch, io, f.dest, p, buf)) |have| {
+                if (f.load(scratch, io, p, buf)) |have| {
                     if (f.meta.verify(p, have)) |_| {
                         f.finish(p, true, true, "");
                         continue;
@@ -813,12 +875,22 @@ const Fetch = struct {
                 };
                 // Each retry moves to the next server whose range covers this piece, so a
                 // mirror that is down costs one attempt rather than every attempt.
-                const url = f.meta.pieceUrlFrom(scratch, p, s, attempt) catch continue;
+                // Once the torrent's own servers have failed more often than they delivered, the
+                // mirrors go first, so a blocked host costs a few pieces and not every one.
+                const bad = @atomicLoad(usize, &f.primary_bad, .monotonic);
+                const demoted = f.mirrors_first or (bad >= primary_give_up and bad > @atomicLoad(usize, &f.primary_ok, .monotonic));
+                const target = f.meta.pieceTarget(scratch, p, s, attempt, demoted) catch continue;
+                const url = target.url;
+                // The CDN token is Blizzard's; a mirror is not sent it. A server that has a mirror
+                // behind it gets a shorter deadline.
+                const cookie = if (target.mirror) null else f.cookie;
+                const deadline = if (!target.mirror and f.meta.hasMirror(p)) f.primary_timeout_ms else f.timeout_ms;
                 // Without a watchdog there is no deadline, but the piece is still fetched.
                 const body = (if (watchdog != null)
-                    fetchAttempt(scratch, io, &client, url, f.cookie, &watch, f.timeout_ms)
+                    fetchAttempt(scratch, io, &client, url, cookie, &watch, deadline)
                 else
-                    fetchUrl(scratch, &client, url, f.cookie)) catch |e| {
+                    fetchUrl(scratch, &client, url, cookie)) catch |e| {
+                    if (!target.mirror) _ = @atomicRmw(usize, &f.primary_bad, .Add, 1, .monotonic);
                     last_err = if (e == error.HttpStatus)
                         std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
                     else
@@ -828,7 +900,7 @@ const Fetch = struct {
                         client.deinit();
                         client = .{ .allocator = stable, .io = io };
                         if (attempt < f.retries)
-                            f.rep.say(.downloading, "\n  piece {d}: no answer for {d} s, trying again on a new connection\n", .{ p, f.timeout_ms / 1000 });
+                            f.rep.say(.downloading, "\n  piece {d}: no answer for {d} s, trying again on a new connection\n", .{ p, deadline / 1000 });
                     }
                     // A little longer between tries each time.
                     std.Io.sleep(io, .fromMilliseconds(@intCast(250 * (attempt + 1))), .awake) catch {};
@@ -842,10 +914,11 @@ const Fetch = struct {
                     last_err = "hash mismatch";
                     continue;
                 };
-                writePiece(f.meta, scratch, io, f.dest, p, body) catch |e| {
+                f.store(scratch, io, p, body) catch |e| {
                     last_err = @errorName(e);
                     continue;
                 };
+                if (!target.mirror) _ = @atomicRmw(usize, &f.primary_ok, .Add, 1, .monotonic);
                 break true;
             } else false;
 
@@ -930,13 +1003,16 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
         if (!opts.no_base and std.mem.eql(u8, code, "D2XP")) &.{ "D2DV", "D2XP" } else if (!opts.no_base and std.mem.eql(u8, code, "W3XP")) &.{ "WAR3", "W3XP" } else &.{opts.product};
 
     // The requested product's stub, resolved once and reused by its own pass.
+    var requested_embedded = false;
     var requested: ?[]u8 = null;
 
     // Both halves land in one game directory, named for what was actually asked for.
     const game_root = if (opts.game_dir.len != 0) opts.game_dir else blk: {
         rep.begin(code);
         rep.set(.resolving, 0, 0, opts.product);
-        requested = try resolveStub(arena, io, &client, opts.product, opts.locale, opts.os, &rep);
+        const got = try resolveOrEmbedded(arena, io, &client, opts, opts.product, &rep);
+        requested = got.stub;
+        requested_embedded = got.embedded;
         const m = try legacy.fromStub(arena, requested.?);
         break :blk try std.fmt.allocPrint(arena, "{s}/{s}-game", .{ dir_path, m.name });
     };
@@ -948,10 +1024,15 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
         if (targets.len > 1) rep.say(.resolving, "\n=== {s} ===\n", .{target});
 
         const is_requested = targets.len == 1 or std.mem.eql(u8, label, code);
-        const stub = if (is_requested and requested != null)
-            requested.?
-        else
-            try resolveStub(arena, io, &client, target, opts.locale, opts.os, &rep);
+        var from_embedded = false;
+        const stub = if (is_requested and requested != null) blk: {
+            from_embedded = requested_embedded;
+            break :blk requested.?;
+        } else blk: {
+            const got = try resolveOrEmbedded(arena, io, &client, opts, target, &rep);
+            from_embedded = got.embedded;
+            break :blk got.stub;
+        };
         var meta = try legacy.fromStub(arena, stub);
 
         // The pieces are numbered files under one base, so any host laid out the same way serves
@@ -963,6 +1044,7 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
             meta.servers = try mirrors.toOwnedSlice(arena);
             meta.direct_download = b;
         }
+        if (opts.mirrors.len != 0) try meta.addMirrors(arena, opts.mirrors);
         // Without a token every piece request comes back 403.
         const cookie = opts.cookie orelse meta.token;
         rep.set(.resolving, 1, 1, meta.name);
@@ -986,6 +1068,7 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 .cookie = cookie,
                 .control = opts.control,
                 .label = dir_path,
+                .mirrors_first = from_embedded,
             }, &rep);
             if (got.failed == 0) break;
             if (!another_round(round, before, got.failed)) return error.Incomplete;
@@ -997,6 +1080,29 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
         try installPayload(arena, gpa, io, &rep, &client, opts, dest, game_root, if (pass + 1 == targets.len) opts.version else null);
     }
     rep.set(.done, 1, 1, game_root);
+}
+
+/// The stub for `product`: from Blizzard, or, when Blizzard will not hand it out and a mirror is
+/// configured, the metainfo compiled into the library, which carries the same piece hashes.
+fn resolveOrEmbedded(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    client: *std.http.Client,
+    opts: Options,
+    product: []const u8,
+    rep: *Reporter,
+) !struct { stub: []u8, embedded: bool } {
+    const have = if (opts.mirrors.len != 0 and product.len <= 8) legacy.embedded(product, opts.locale, opts.os) else null;
+    // With a copy at hand there is no point in asking Blizzard over and over.
+    const tries: usize = if (have != null) 1 else stubfetch.attempts;
+    if (resolveStubTries(gpa, io, client, product, opts.locale, opts.os, rep, tries)) |stub| {
+        return .{ .stub = stub, .embedded = false };
+    } else |e| {
+        if (e == error.Cancelled) return e;
+        const bytes = have orelse return e;
+        rep.say(.resolving, "Blizzard did not hand out {s} ({t}); using the metainfo built into this program\n", .{ product, e });
+        return .{ .stub = try gpa.dupe(u8, bytes), .embedded = true };
+    }
 }
 
 /// Rounds of the whole fetch an install makes after the first, and the pause before each (times its number).

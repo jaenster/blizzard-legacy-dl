@@ -472,3 +472,59 @@ test "a cancelled install stops early, and the next one resumes from what is on 
     try std.testing.expectEqual(@as(usize, 0), second.backwards);
     try std.testing.expectEqual(mini.total, second.last(.downloading).?.done);
 }
+
+test "with Blizzard's host dead, a mirror serves the whole payload and the install still verifies" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The torrent names http://127.0.0.1/x, where nothing listens; the mirror is the loopback server.
+    const mini = try Mini.build(gpa, io, try tmpPath(gpa, &tmp, ""));
+    defer _ = close(listener);
+    var rec: Recorder = .{ .gpa = gpa };
+    const game = try tmpPath(gpa, &tmp, "game");
+
+    try installer.install(std.testing.allocator, io, .{
+        .product = mini.torrent_path,
+        .version = null,
+        .game_dir = game,
+        .cache_dir = try tmpPath(gpa, &tmp, "cache"),
+        .mirrors = mini.base,
+        .jobs = 3,
+        .progress = .{ .ctx = &rec, .report = Recorder.report },
+    });
+    try std.testing.expectEqual(mini.pieces, rec.pieceEvents(false));
+    try std.testing.expectEqual(mini.pieces, served.load(.monotonic));
+    const readme = try installer.readFile(gpa, io, try std.fmt.allocPrint(gpa, "{s}/readme.txt", .{game}));
+    try std.testing.expectEqualStrings("hello", readme);
+}
+
+test "a mirror that serves wrong bytes is refused and nothing is installed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const mini = try Mini.build(gpa, io, try tmpPath(gpa, &tmp, ""));
+    defer _ = close(listener);
+    // Tamper with what the server hands out after the hashes were taken.
+    const bad = try gpa.dupe(u8, blob);
+    for (bad) |*b| b.* ^= 0x5a;
+    blob = bad;
+
+    const result = installer.install(std.testing.allocator, io, .{
+        .product = mini.torrent_path,
+        .version = null,
+        .game_dir = try tmpPath(gpa, &tmp, "game"),
+        .cache_dir = try tmpPath(gpa, &tmp, "cache"),
+        .mirrors = mini.base,
+        .jobs = 2,
+        .retries = 1,
+    });
+    try std.testing.expectError(error.Incomplete, result);
+}

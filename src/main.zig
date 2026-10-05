@@ -26,6 +26,7 @@ const usage =
     \\  verify  <stub> [-o dir]            re-verify an assembled payload
     \\  install <stub> [-o dir] [opts]     fetch, then build the game directory from it
     \\  run     <stub> [-o dir] [opts]     the whole downloader sequence, headless
+    \\  mirror  <product> -o <dir>         copy a payload from Blizzard into a directory to serve as a mirror
     \\  proxy   [--port n] [--bind ip]     watch what the real downloader sends, verbatim
     \\
     \\fetch options:
@@ -33,6 +34,8 @@ const usage =
     \\  --to <n>     last piece, inclusive (default: the last one)
     \\  --retries <n>  per-piece retries before giving up (default 3)
     \\  --base <url> fetch pieces from a mirror instead of the (dead) Blizzard host
+    \\  --mirror <url> also fetch from this mirror when Blizzard's servers do not deliver; it holds
+    \\                 the pieces under the same path (several mirrors separated by |)
     \\  --jobs <n>     pieces to fetch at once (default 4)
     \\  --sequential   fetch pieces in order; the client shuffles them, and so do we
     \\  --cookie <v>   override the CDN access token taken from the stub
@@ -104,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     var to: ?usize = null;
     var retries: usize = 3;
     var base: ?[]const u8 = null;
+    var mirror_roots: []const u8 = "";
     var ini_path: ?[]const u8 = null;
     var server_config: ?[]const u8 = null;
     var no_tracker = false;
@@ -180,6 +184,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--cookie") and i + 1 < argv.len) {
             i += 1;
             cookie_override = argv[i];
+        } else if (std.mem.eql(u8, a, "--mirror") and i + 1 < argv.len) {
+            i += 1;
+            mirror_roots = argv[i];
         } else if (std.mem.eql(u8, a, "--base") and i + 1 < argv.len) {
             i += 1;
             base = argv[i];
@@ -250,6 +257,41 @@ pub fn main(init: std.process.Init) !void {
     const progress: installer.Progress = .{ .ctx = &term, .report = Term.report };
     term.rep = .init(progress);
 
+    // Copy a payload's pieces from Blizzard into a directory laid out the way Blizzard serves them,
+    // so putting that directory behind any web server makes a mirror `--mirror` can use. Every piece
+    // is checked against its hash before it is kept, and the metainfo goes in last, so a directory
+    // that has it is complete.
+    if (std.mem.eql(u8, verb, "mirror")) {
+        const stub = try installer.resolveStub(gpa, init.io, &client, argv[2], locale, os_, &term.rep);
+        const meta = try legacy.fromStub(gpa, stub);
+        if (meta.servers.len == 0) return error.NoServers;
+        const path = legacy.urlPath(meta.servers[0].url);
+        const root = out_dir orelse ".";
+        const dir = try zpath(gpa, &.{ root, std.mem.trimStart(u8, path, "/") });
+        try mkdirs(init.io, dir);
+        std.debug.print("{s}: {d} pieces, {d} bytes -> {s}\n", .{ meta.name, meta.pieceCount(), meta.total, dir });
+        const got = try installer.fetchPayload(gpa, init.io, meta, "", .{
+            .first = from,
+            .last = to,
+            .retries = retries,
+            .jobs = jobs,
+            .sequential = sequential,
+            .cookie = cookie_override orelse meta.token,
+            .label = dir,
+            .piece_dir = dir,
+        }, &term.rep);
+        if (got.failed != 0) return error.Incomplete;
+        if (from != 0 or to != null) return;
+        const torrent = try zpath(gpa, &.{ dir, legacy.metainfo_name });
+        const f = try createFile(init.io, torrent);
+        defer f.close(init.io);
+        const bytes = meta.raw[meta.at..meta.end];
+        try f.writePositionalAll(init.io, bytes, 0);
+        try f.setLength(init.io, bytes.len);
+        std.debug.print("wrote {s} ({d} bytes, infohash {x})\n", .{ torrent, bytes.len, meta.infohash });
+        return;
+    }
+
     // The payload is scratch on the way to a game directory, and running the command from
     // somewhere else should not mean fetching the same immutable gigabyte and a half again, so
     // install keeps payloads in a cache every install shares. An expansion installs over its base
@@ -270,6 +312,7 @@ pub fn main(init: std.process.Init) !void {
             .platform = if (std.mem.eql(u8, platform, "macos")) .macos else .win32,
             .language = language,
             .base_url = base,
+            .mirrors = mirror_roots,
             .cookie = cookie_override,
             .retries = retries,
             .sequential = sequential,
@@ -292,6 +335,8 @@ pub fn main(init: std.process.Init) !void {
         meta.servers = try mirrors.toOwnedSlice(gpa);
         meta.direct_download = b;
     }
+
+    if (mirror_roots.len != 0) try meta.addMirrors(gpa, mirror_roots);
 
     // `run` walks the client's own start-up sequence rather than jumping straight to the
     // pieces. Each stage is printed as it happens, because most of the interesting behaviour is
