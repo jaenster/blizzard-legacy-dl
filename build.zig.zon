@@ -3,8 +3,8 @@
     .version = "0.2.0",
     .dependencies = .{
         .libd2 = .{
-            .url = "git+https://github.com/jaenster/libd2#8c64e0dc559d06cfccf9c012d78dafcb3da1a839",
-            .hash = "libd2-0.6.5-wboU7VHPqgH-DeItf4otZP8H3ODIXGUONuJUNwSbRJTt",
+            .url = "git+https://github.com/jaenster/libd2#9d1b74f0dadae3c1d0fc6201c6e7d5651f31f14f",
+            .hash = "libd2-0.6.5-wboU7QvOqgEabFV3Plbi_39e-rZTcSMYd0wh0tVcB2eq",
         },
     },
     .fingerprint = 0x28fb401ea38e62d5,
