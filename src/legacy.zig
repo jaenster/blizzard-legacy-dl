@@ -199,7 +199,7 @@ pub fn expandServerUrls(gpa: std.mem.Allocator, spec: []const u8, out: *std.Arra
             var n = a;
             while (n <= b) : (n += 1) {
                 try out.append(gpa, .{
-                    .url = try std.fmt.allocPrint(gpa, "{s}{d}{s}", .{ prefix, n, path }),
+                    .url = try gpa.print("{s}{d}{s}", .{ prefix, n, path }),
                 });
             }
         }
@@ -293,9 +293,9 @@ pub const Metainfo = struct {
         else
             self.direct_download;
         return if (salt) |s|
-            std.fmt.allocPrint(gpa, "{s}/{d}?{s}", .{ base, index, s })
+            gpa.print("{s}/{d}?{s}", .{ base, index, s })
         else
-            std.fmt.allocPrint(gpa, "{s}/{d}", .{ base, index });
+            gpa.print("{s}/{d}", .{ base, index });
     }
 
     /// Add mirrors: `roots` is one or more host roots (`https://host` or `https://host/prefix`)
@@ -312,7 +312,7 @@ pub const Metainfo = struct {
             for (self.servers) |s| {
                 if (s.mirror) continue;
                 const path = urlPath(s.url);
-                const url = try std.fmt.allocPrint(gpa, "{s}{s}", .{ root, path });
+                const url = try gpa.print("{s}{s}", .{ root, path });
                 var dup = false;
                 for (out.items) |o| {
                     if (std.mem.eql(u8, o.url, url) and o.first == s.first and o.last == s.last) dup = true;
@@ -354,9 +354,9 @@ pub const Metainfo = struct {
                 const base = std.mem.trimEnd(u8, s.url, "/");
                 // The cache-buster is for Blizzard's CDN; a mirror is served as is.
                 const url = if (salt != null and !s.mirror)
-                    try std.fmt.allocPrint(gpa, "{s}/{d}?{s}", .{ base, index, salt.? })
+                    try gpa.print("{s}/{d}?{s}", .{ base, index, salt.? })
                 else
-                    try std.fmt.allocPrint(gpa, "{s}/{d}", .{ base, index });
+                    try gpa.print("{s}/{d}", .{ base, index });
                 return .{ .url = url, .mirror = s.mirror };
             }
         }
@@ -537,7 +537,7 @@ test "a piece that is not a whole piece long is the last one" {
         .raw = "", .at = 0, .end = 0, .announce = "", .direct_download = "http://h/base",
         .servers = &.{},
         .locale = "", .launch_target = "", .name = "x",
-        .piece_length = 100, .pieces = &[_]u8{0} ** 60, .files = &.{}, .total = 250,
+        .piece_length = 100, .pieces = &@as([60]u8, @splat(0)), .files = &.{}, .total = 250,
         .infohash = undefined,
     };
     try testing.expectEqual(@as(usize, 3), m.pieceCount());
@@ -551,7 +551,7 @@ test "piece urls are the base plus an index, and a salt only on retry" {
         .raw = "", .at = 0, .end = 0, .announce = "", .direct_download = "http://h/base",
         .servers = &.{},
         .locale = "", .launch_target = "", .name = "x",
-        .piece_length = 100, .pieces = &[_]u8{0} ** 20, .files = &.{}, .total = 100,
+        .piece_length = 100, .pieces = &@as([20]u8, @splat(0)), .files = &.{}, .total = 100,
         .infohash = undefined,
     };
     const a = try m.pieceUrl(gpa, 7, null);
@@ -681,7 +681,7 @@ pub fn announceUrl(
     defer gpa.free(pid);
     const k = try urlEscape(gpa, key);
     defer gpa.free(k);
-    return std.fmt.allocPrint(gpa, "{s}?info_hash={s}&peer_id={s}&key={s}&port=3724" ++
+    return gpa.print("{s}?info_hash={s}&peer_id={s}&key={s}&port=3724" ++
         "&uploaded=0&downloaded={d}&left={d}&event={s}", .{
         announce,
         ih,
@@ -752,8 +752,8 @@ pub fn parseAnnounce(gpa: std.mem.Allocator, body: []const u8) !Announce {
 
 test "the announce url is built the way the client builds it" {
     const gpa = testing.allocator;
-    const ih: [20]u8 = .{0xAB} ** 20;
-    const pid: [20]u8 = .{'a'} ** 20;
+    const ih: [20]u8 = @splat(0xAB);
+    const pid: [20]u8 = @splat('a');
     const u = try announceUrl(gpa, "http://t.example/announce", ih, pid, "k1", .started);
     defer gpa.free(u);
     try testing.expect(std.mem.startsWith(u8, u, "http://t.example/announce?info_hash=%AB%AB"));

@@ -21,7 +21,7 @@
 //! those threads.
 const std = @import("std");
 const builtin = @import("builtin");
-const native_os = builtin.os.tag;
+const native_os = builtin.target.os.tag;
 
 const is_win = native_os == .windows;
 /// The BSDs, macOS among them, begin `sockaddr` with a length byte where everyone else has the
@@ -218,7 +218,7 @@ fn serve(client: Sock) void {
 
     // Absolute form is for us; the origin gets the path on its own, as any proxy would send it.
     var line: [8 * 1024]u8 = undefined;
-    const rewritten = std.fmt.bufPrint(&line, "{s} {s} {s}\r\n", .{ method, path, version }) catch return;
+    const rewritten = std.mem.print(&line, "{s} {s} {s}\r\n", .{ method, path, version }) catch return;
     if (!sendAll(up, rewritten)) return;
     if (!sendAll(up, head[line_end + 2 .. len])) return; // headers, and any body already read
 

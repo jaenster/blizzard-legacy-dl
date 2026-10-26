@@ -68,7 +68,7 @@ pub fn classify(status: u16, content_type: []const u8, head: []const u8, body_le
     switch (status) {
         200, 206 => {
             if (body_len == 0) return .empty;
-            if (std.ascii.indexOfIgnoreCase(content_type, "html") != null or looksLikeHtml(head)) return .web_page;
+            if (std.ascii.findIgnoreCase(content_type, "html") != null or looksLikeHtml(head)) return .web_page;
             if (body_len < min_stub_bytes) return .empty;
             return .ok;
         },

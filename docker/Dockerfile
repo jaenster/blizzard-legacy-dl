@@ -7,7 +7,7 @@
 #   docker run --rm blizzard-legacy-dl info D2XP
 #   docker run --rm -v "$PWD:/data" blizzard-legacy-dl fetch D2XP -o /data
 FROM --platform=$BUILDPLATFORM alpine:3.22 AS build
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 ARG BUILDARCH
 ARG TARGETARCH
 RUN apk add --no-cache curl tar xz && \

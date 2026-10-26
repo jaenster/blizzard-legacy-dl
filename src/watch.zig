@@ -103,7 +103,7 @@ pub fn nowMs(io: std.Io) i64 {
 /// disconnect does (a graceful one leaves a pending receive waiting), and closing the socket instead
 /// would complete the receive as cancelled, which Zig's reader treats as impossible.
 pub fn abortConnection(io: std.Io, s: std.Io.net.Stream) void {
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         s.shutdown(io, .both) catch {};
         return;
     }

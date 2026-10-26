@@ -94,8 +94,8 @@ pub const Secrets = struct {
         if (std.mem.eql(u8, object, "user")) return self.owner;
         if (!std.mem.startsWith(u8, object, "cdkey")) return null;
         return switch (product_id orelse return null) {
-            @intFromEnum(keystore.Product.classic) => self.classic,
-            @intFromEnum(keystore.Product.expansion) => self.expansion,
+            @backingInt(keystore.Product.classic) => self.classic,
+            @backingInt(keystore.Product.expansion) => self.expansion,
             else => null,
         };
     }
@@ -190,7 +190,7 @@ pub const Reporter = struct {
     progress: ?Progress = null,
     product: []const u8 = "",
     lock: std.atomic.Value(bool) = .init(false),
-    counters: [@typeInfo(Stage).@"enum".fields.len][2]u64 = @splat(.{ 0, 0 }),
+    counters: [@typeInfo(Stage).@"enum".field_names.len][2]u64 = @splat(.{ 0, 0 }),
 
     pub fn init(progress: ?Progress) Reporter {
         return .{ .progress = progress };
@@ -224,7 +224,7 @@ pub const Reporter = struct {
     fn set(r: *Reporter, stage: Stage, done: u64, total: u64, file: []const u8) void {
         r.acquire();
         defer r.release();
-        const c = &r.counters[@intFromEnum(stage)];
+        const c = &r.counters[@backingInt(stage)];
         c[0] = @max(c[0], done);
         c[1] = total;
         r.emitLocked(.{ .stage = stage, .done = c[0], .total = c[1], .file = file });
@@ -234,10 +234,10 @@ pub const Reporter = struct {
     fn say(r: *Reporter, stage: Stage, comptime fmt: []const u8, args: anytype) void {
         if (r.progress == null) return;
         var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+        const msg = std.mem.print(&buf, fmt, args) catch buf[0..];
         r.acquire();
         defer r.release();
-        const c = r.counters[@intFromEnum(stage)];
+        const c = r.counters[@backingInt(stage)];
         r.emitLocked(.{ .stage = stage, .done = c[0], .total = c[1], .message = msg });
     }
 };
@@ -300,10 +300,10 @@ pub fn defaultCacheDir(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
         getenv("XDG_CACHE_HOME") orelse
         getenv("LOCALAPPDATA") orelse
         if (getenv("HOME")) |home|
-            try std.fmt.allocPrint(gpa, "{s}/.cache", .{home})
+            try gpa.print("{s}/.cache", .{home})
         else
             return ".";
-    const dir = try std.fmt.allocPrint(gpa, "{s}/blizzard-legacy-dl", .{base});
+    const dir = try gpa.print("{s}/blizzard-legacy-dl", .{base});
     mkdirs(io, dir) catch return ".";
     return dir;
 }
@@ -344,7 +344,7 @@ test "a request that stalls is abandoned at its deadline" {
     defer arena.deinit();
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
-    const url = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/0", .{port});
+    const url = try arena.allocator().print("http://127.0.0.1:{d}/0", .{port});
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Timeout, fetchWithin(arena.allocator(), io, &client, url, null, 300));
     const took = start.untilNow(io, .awake).toMilliseconds();
@@ -389,7 +389,7 @@ fn writeWhole(io: std.Io, path: []const u8, data: []const u8) !void {
 
 fn fileExists(io: std.Io, dir: []const u8, name: []const u8) bool {
     var buf: [512]u8 = undefined;
-    const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const full = std.mem.print(&buf, "{s}/{s}", .{ dir, name }) catch return false;
     const f = openFile(io, full, .read_only) catch return false;
     f.close(io);
     return true;
@@ -425,7 +425,7 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
     const conn = try connect.open(client, uri);
     var req = try client.request(.GET, uri, .{
         .connection = conn,
-        .redirect_behavior = @enumFromInt(3),
+        .redirect_behavior = @fromBackingInt(3),
         .headers = .{ .user_agent = .{ .override = legacy.user_agent } },
         .extra_headers = if (cookie != null) &with_cookie else &.{
             .{ .name = "Pragma", .value = "no-cache" },
@@ -442,9 +442,9 @@ fn fetchUrlWatched(gpa: std.mem.Allocator, client: *std.http.Client, url: []cons
     var final_url: [stubfetch.Diag.url_cap]u8 = undefined;
     var fw = std.Io.Writer.fixed(&final_url);
     req.uri.format(&fw) catch {};
-    last_fetch.setResponse(@intFromEnum(res.head.status), res.head.content_type, fw.buffered());
+    last_fetch.setResponse(@backingInt(res.head.status), res.head.content_type, fw.buffered());
     const ok_status = res.head.status == .ok or res.head.status == .partial_content;
-    if (!ok_status) last_status = @intFromEnum(res.head.status);
+    if (!ok_status) last_status = @backingInt(res.head.status);
     // The CDN compresses when asked, and the client asks by default; undone here as fetch does.
     const decompress_buffer: []u8 = switch (res.head.content_encoding) {
         .identity => &.{},
@@ -483,7 +483,7 @@ fn evidence(buf: []u8) []const u8 {
     const head = last_fetch.describe(buf[0..@min(buf.len, 400)]);
     const note = connect.last_note.text();
     if (note.len == 0) return head;
-    return std.fmt.bufPrint(buf, "{s} [connect: {s}]", .{ head, std.mem.trimEnd(u8, note, "; ") }) catch head;
+    return std.mem.print(buf, "{s} [connect: {s}]", .{ head, std.mem.trimEnd(u8, note, "; ") }) catch head;
 }
 
 /// A path on disk if there is one there, otherwise a product code to fetch from Blizzard.
@@ -515,7 +515,7 @@ fn resolveStubTries(
     var code: std.ArrayList(u8) = .empty;
     defer code.deinit(gpa);
     for (arg) |c| try code.append(gpa, std.ascii.toUpper(c));
-    const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{
+    const url = try gpa.print("{s}?product={s}&locale={s}&os={s}", .{
         getlegacy, code.items, locale, os_,
     });
     defer gpa.free(url);
@@ -694,7 +694,7 @@ pub fn fetchPayload(gpa: std.mem.Allocator, io: std.Io, meta: legacy.Metainfo, d
     {
         rep.acquire();
         defer rep.release();
-        rep.counters[@intFromEnum(Stage.downloading)] = .{ 0, total };
+        rep.counters[@backingInt(Stage.downloading)] = .{ 0, total };
         rep.emitLocked(.{ .stage = .downloading, .done = 0, .total = total, .pieces = .{ .first = opts.first, .count = order.len } });
     }
 
@@ -803,7 +803,7 @@ const Fetch = struct {
     /// A piece already kept, wherever this fetch keeps them.
     fn load(f: *Fetch, gpa: std.mem.Allocator, io: std.Io, index: usize, buf: []u8) ![]u8 {
         const dir = f.piece_dir orelse return readPiece(f.meta, gpa, io, f.dest, index, buf);
-        const name = try std.fmt.allocPrint(gpa, "{s}/{d}", .{ dir, index });
+        const name = try gpa.print("{s}/{d}", .{ dir, index });
         const file = try openFile(io, name, .read_only);
         defer file.close(io);
         const n = try file.readPositionalAll(io, buf, 0);
@@ -812,7 +812,7 @@ const Fetch = struct {
 
     fn store(f: *Fetch, gpa: std.mem.Allocator, io: std.Io, index: usize, data: []const u8) !void {
         const dir = f.piece_dir orelse return writePiece(f.meta, gpa, io, f.dest, index, data);
-        const name = try std.fmt.allocPrint(gpa, "{s}/{d}", .{ dir, index });
+        const name = try gpa.print("{s}/{d}", .{ dir, index });
         try writeWhole(io, name, data);
     }
 
@@ -892,7 +892,7 @@ const Fetch = struct {
                     fetchUrl(scratch, &client, url, cookie)) catch |e| {
                     if (!target.mirror) _ = @atomicRmw(usize, &f.primary_bad, .Add, 1, .monotonic);
                     last_err = if (e == error.HttpStatus)
-                        std.fmt.allocPrint(scratch, "HTTP {d}", .{last_status}) catch "HttpStatus"
+                        scratch.print("HTTP {d}", .{last_status}) catch "HttpStatus"
                     else
                         @errorName(e);
                     if (e == error.Timeout) {
@@ -927,7 +927,7 @@ const Fetch = struct {
                 continue;
             }
             var msg_buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "\n  piece {d}: {s} after {d} tries\n", .{ p, last_err, f.retries + 1 }) catch "";
+            const msg = std.mem.print(&msg_buf, "\n  piece {d}: {s} after {d} tries\n", .{ p, last_err, f.retries + 1 }) catch "";
             f.finish(p, false, false, msg);
             // One failure is a blip; a wall of them with nothing succeeding means the CDN
             // is refusing us, and grinding through thousands of pieces to learn that
@@ -951,13 +951,13 @@ const Fetch = struct {
         } else {
             _ = @atomicRmw(usize, &f.failed, .Add, 1, .monotonic);
         }
-        f.rep.counters[@intFromEnum(Stage.downloading)] = .{ f.bytes, f.total };
+        f.rep.counters[@backingInt(Stage.downloading)] = .{ f.bytes, f.total };
         var label: [24]u8 = undefined;
         f.rep.emitLocked(.{
             .stage = .downloading,
             .done = f.bytes,
             .total = f.total,
-            .file = std.fmt.bufPrint(&label, "piece {d}", .{piece}) catch "",
+            .file = std.mem.print(&label, "piece {d}", .{piece}) catch "",
             .message = message,
             .pieces = .{
                 .index = piece,
@@ -1014,7 +1014,7 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
         requested = got.stub;
         requested_embedded = got.embedded;
         const m = try legacy.fromStub(arena, requested.?);
-        break :blk try std.fmt.allocPrint(arena, "{s}/{s}-game", .{ dir_path, m.name });
+        break :blk try arena.print("{s}/{s}-game", .{ dir_path, m.name });
     };
 
     for (targets, 0..) |target, pass| {
@@ -1156,9 +1156,9 @@ fn installPayload(
     var found: usize = 0;
     for (0..6) |n| {
         const name = if (n == 0)
-            try std.fmt.allocPrint(gpa, "{s}/Installer Tome.mpq", .{payload})
+            try gpa.print("{s}/Installer Tome.mpq", .{payload})
         else
-            try std.fmt.allocPrint(gpa, "{s}/Installer Tome {d}.mpq", .{ payload, n + 1 });
+            try gpa.print("{s}/Installer Tome {d}.mpq", .{ payload, n + 1 });
         const bytes = readFile(gpa, io, name) catch continue;
         set.add(gpa, bytes) catch continue;
         found += 1;
@@ -1173,7 +1173,7 @@ fn installPayload(
         return error.NoManifest;
     };
     // An expansion installs over the base game, and deletes from where it already sits.
-    const original = try std.fmt.allocPrint(gpa, "{s}/", .{game});
+    const original = try gpa.print("{s}/", .{game});
     const plan = try script.parse(gpa, manifest, .{
         .platform = switch (opts.platform) {
             .win32 => .win32,
@@ -1242,7 +1242,7 @@ fn installPayload(
                     rep.say(.installing, "  not deleting {s} (not a plain file in the game folder)\n", .{rel});
                     continue;
                 }
-                const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
+                const full = try gpa.print("{s}/{s}", .{ game, rel });
                 defer gpa.free(full);
                 if (std.mem.lastIndexOfScalar(u8, full, '/')) |cut| try mkdirs(io, full[0..cut]);
                 try writeWhole(io, full, data);
@@ -1283,7 +1283,7 @@ fn installPayload(
                     rep.say(.installing, "  not deleting {s} (not a plain file in the game folder)\n", .{rel});
                     continue;
                 }
-                const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, rel });
+                const full = try gpa.print("{s}/{s}", .{ game, rel });
                 defer gpa.free(full);
                 Dir.cwd().deleteFile(io, full) catch {};
                 rep.say(.installing, "  replacing {s}\n", .{rel});
@@ -1299,7 +1299,7 @@ fn installPayload(
             step += 1;
             rep.set(.installing, step, steps, container);
         }
-        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, container });
+        const path = try gpa.print("{s}/{s}", .{ game, container });
         defer gpa.free(path);
         const before = readFile(big, io, path) catch continue;
         defer big.free(before);
@@ -1353,7 +1353,7 @@ fn patchTo(
     // Version strings are written 1.09b but the archives are named 109b.
     var tidy: std.ArrayList(u8) = .empty;
     for (version) |c| if (c != '.') try tidy.append(gpa, c);
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}Patch_{s}.exe", .{
+    const url = try gpa.print("{s}/{s}Patch_{s}.exe", .{
         source, if (expansion) "LOD" else "D2", tidy.items,
     });
     rep.set(.patching, 0, 0, url);
@@ -1425,7 +1425,7 @@ fn patchTo(
 
         // The source is the original build for this product, not what is on disk.
         const src = base.get(name) orelse blk: {
-            const member = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, name });
+            const member = try gpa.print("{s}{s}", .{ prefix, name });
             const b = set.read(gpa, member) catch &[_]u8{};
             try base.put(gpa, name, b);
             break :blk b;
@@ -1434,7 +1434,7 @@ fn patchTo(
             rep.say(.patching, "  refused {s}: {t}\n", .{ name, e });
             continue;
         };
-        const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, name });
+        const full = try gpa.print("{s}/{s}", .{ game, name });
         try writeWhole(io, full, out);
         wrote += 1;
     }
@@ -1468,7 +1468,7 @@ fn patchTo(
         for (installed_archives) |archive_name| {
             if (deltas == 0) break;
             try checkpoint(io, control);
-            const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
+            const path = try gpa.print("{s}/{s}", .{ game, archive_name });
             defer gpa.free(path);
             const bytes = readFile(big, io, path) catch continue;
             defer big.free(bytes);
@@ -1505,7 +1505,7 @@ fn patchTo(
             const empty = try mpq.empty(gpa, slots);
             const built = try mpq.append(big, empty, members.items);
             defer big.free(built);
-            const full = try std.fmt.allocPrint(gpa, "{s}/patch_d2.mpq", .{game});
+            const full = try gpa.print("{s}/patch_d2.mpq", .{game});
             try writeWhole(io, full, built);
             rebuilt = members.items.len - 1; // the listfile is ours, not one of the patch's members
         }
@@ -1521,7 +1521,7 @@ fn patchTo(
     if (fileExists(io, game, "Storm.dll")) {
         for (installed_archives) |archive_name| {
             try checkpoint(io, control);
-            const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ game, archive_name });
+            const path = try gpa.print("{s}/{s}", .{ game, archive_name });
             defer gpa.free(path);
             const bytes = readFile(big, io, path) catch continue;
             defer big.free(bytes);

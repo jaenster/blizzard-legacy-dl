@@ -59,7 +59,7 @@ fn serve() void {
         }
         const body = blob[at..@min(at + piece_len, blob.len)];
         var head: [128]u8 = undefined;
-        const h = std.fmt.bufPrint(&head, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch continue;
+        const h = std.mem.print(&head, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch continue;
         _ = send(c, h.ptr, h.len, 0);
         var off: usize = 0;
         while (off < body.len) {
@@ -144,7 +144,7 @@ test "a payload survives being cut into pieces, served, fetched and reassembled"
     defer _ = close(listener);
 
     var mirrors: std.ArrayList(legacy.Server) = .empty;
-    try mirrors.append(gpa, .{ .url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port}) });
+    try mirrors.append(gpa, .{ .url = try gpa.print("http://127.0.0.1:{d}", .{port}) });
     meta.servers = mirrors.items;
 
     // Fetch every piece, check it against the torrent, and lay it back down where it belongs.
@@ -256,7 +256,7 @@ const Mini = struct {
         try w.writeAll(hashes.items);
         try w.writeAll("ee");
 
-        const torrent_path = try std.fmt.allocPrint(gpa, "{s}/mini.torrent", .{dir});
+        const torrent_path = try gpa.print("{s}/mini.torrent", .{dir});
         const f = try std.Io.Dir.cwd().createFile(io, torrent_path, .{});
         defer f.close(io);
         try f.writePositionalAll(io, t.written(), 0);
@@ -264,7 +264,7 @@ const Mini = struct {
         const port = try startServer(all.items);
         return .{
             .torrent_path = torrent_path,
-            .base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port}),
+            .base = try gpa.print("http://127.0.0.1:{d}", .{port}),
             .total = all.items.len,
             .pieces = hashes.items.len / 20,
         };
@@ -331,7 +331,7 @@ const Recorder = struct {
 };
 
 fn tmpPath(gpa: std.mem.Allocator, tmp: *const std.testing.TmpDir, leaf: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, leaf });
+    return gpa.print(".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, leaf });
 }
 
 test "install fetches, installs, and reports every stage in order without running backwards" {
@@ -375,14 +375,14 @@ test "install fetches, installs, and reports every stage in order without runnin
     // Stages arrive in pipeline order.
     var at: u8 = 0;
     for (rec.events.items) |e| {
-        try std.testing.expect(@intFromEnum(e.stage) >= at);
-        at = @intFromEnum(e.stage);
+        try std.testing.expect(@backingInt(e.stage) >= at);
+        at = @backingInt(e.stage);
     }
 
     // And the game directory is what the script said.
-    const readme = try installer.readFile(gpa, io, try std.fmt.allocPrint(gpa, "{s}/readme.txt", .{game}));
+    const readme = try installer.readFile(gpa, io, try gpa.print("{s}/readme.txt", .{game}));
     try std.testing.expectEqualStrings("hello", readme);
-    const archive = try installer.readFile(gpa, io, try std.fmt.allocPrint(gpa, "{s}/d2data.mpq", .{game}));
+    const archive = try installer.readFile(gpa, io, try gpa.print("{s}/d2data.mpq", .{game}));
     var arc = try mpq.Archive.open(gpa, archive);
     try std.testing.expectEqualStrings("MZ fog", try arc.read(gpa, "Fog.dll"));
     try std.testing.expectEqualStrings("name\tcode\n", try arc.read(gpa, "data\\global\\excel\\armor.txt"));
@@ -498,7 +498,7 @@ test "with Blizzard's host dead, a mirror serves the whole payload and the insta
     });
     try std.testing.expectEqual(mini.pieces, rec.pieceEvents(false));
     try std.testing.expectEqual(mini.pieces, served.load(.monotonic));
-    const readme = try installer.readFile(gpa, io, try std.fmt.allocPrint(gpa, "{s}/readme.txt", .{game}));
+    const readme = try installer.readFile(gpa, io, try gpa.print("{s}/readme.txt", .{game}));
     try std.testing.expectEqualStrings("hello", readme);
 }
 

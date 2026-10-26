@@ -1,6 +1,6 @@
 # Building
 
-Needs [Zig](https://ziglang.org/download/) 0.16.0 and nothing else.
+Needs [Zig](https://ziglang.org/download/) 0.17.0 and nothing else.
 
 ```
 zig build                       # -> zig-out/bin/blizzard-legacy-dl

@@ -158,7 +158,7 @@ fn expectTimeout(mode: Mode) !void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
     defer client.deinit();
 
-    const url = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/0", .{server.port});
+    const url = try arena.allocator().print("http://127.0.0.1:{d}/0", .{server.port});
     const t0 = nowMs(io);
     const got = installer.fetchWithin(arena.allocator(), io, &client, url, null, 2000);
     const took = nowMs(io) - t0;
@@ -214,7 +214,7 @@ fn fetchPieces(plan: []const Mode, retries: usize, timeout_ms: u64, count: usize
     for (0..count) |_| try w.writeAll(&d);
     try w.writeAll("ee");
     var meta = try legacy.fromStub(gpa, t.written());
-    var mirrors = [_]legacy.Server{.{ .url = try std.fmt.allocPrint(gpa, "http://{s}:{d}", .{ host, server.port }) }};
+    var mirrors = [_]legacy.Server{.{ .url = try gpa.print("http://{s}:{d}", .{ host, server.port }) }};
     meta.servers = &mirrors;
 
     var tmp = std.testing.tmpDir(.{});

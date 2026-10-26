@@ -239,7 +239,7 @@ pub fn openTracked(client: *std.http.Client, uri: std.Uri) !Opened {
     if (idleExpired(client, io)) dropIdle(client);
     touch(client, io);
     var name_buf: [net.HostName.max_len]u8 = undefined;
-    const host = try uri.getHost(&name_buf);
+    const host = try net.HostName.fromUri(uri, &name_buf);
     const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
     // The certificate roots, loaded once per client, as `Client.request` does before it connects.
     if (protocol == .tls) tls: {
@@ -261,7 +261,7 @@ pub fn openTracked(client: *std.http.Client, uri: std.Uri) !Opened {
         std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
     }
     const port = uri.port orelse @as(u16, if (protocol == .tls) 443 else 80);
-    if (client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return .{ .connection = c, .reused = true };
+    if (try client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = protocol })) |c| return .{ .connection = c, .reused = true };
     var found: [32]net.IpAddress = undefined;
     const addrs = try resolve(io, host.bytes, port, &found);
     // One address leaves nothing to choose between: the ordinary connect.
@@ -534,7 +534,7 @@ test "a keep-alive connection the server closed while idle is retried once on a 
     const port = server.listener.socket.address.ip4.port;
     const t = try std.Thread.spawn(.{}, TestServer.run, .{&server});
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
     defer client.deinit();
@@ -569,7 +569,7 @@ test "a connection idle past the limit is not reused, so nothing needs a retry" 
     const port = server.listener.socket.address.ip4.port;
     const t = try std.Thread.spawn(.{}, TestServer.run, .{&server});
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
     defer client.deinit();

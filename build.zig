@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(cli);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run the CLI: zig build run -- info <downloader.exe>").dependOn(&run.step);
 
     const test_step = b.step("test", "Run the tests");
@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{ .{ .name = "installer", .module = installer }, .{ .name = "legacy", .module = legacy } },
             .link_libc = true,
         }),
-        .filters = if (b.option([]const u8, "stall-filter", "Only the stall tests whose name contains this")) |f| b.dupeStrings(&.{f}) else &.{},
+        .filters = if (b.option([]const u8, "stall-filter", "Only the stall tests whose name contains this")) |f| b.graph.dupeStrings(&.{f}) else &.{},
     });
     const stall_step = b.step("stall-test", "Fetch against a server that goes silent (installs the exe when cross-compiling)");
     if (target.result.os.tag == b.graph.host.result.os.tag)
@@ -135,7 +135,7 @@ pub fn build(b: *std.Build) void {
 }
 
 /// The installer module built for a target other than the one given on the command line.
-fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn installerFor(b: *std.Build, query: std.Target.Query, optimize: std.lang.Optimize) *std.Build.Module {
     const target = b.resolveTargetQuery(query);
     const libd2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
     const legacy = b.createModule(.{

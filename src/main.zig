@@ -84,7 +84,7 @@ fn human(n: u64, buf: []u8) []const u8 {
     var v: f64 = @floatFromInt(n);
     var u: usize = 0;
     while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
-    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[u] }) catch "?";
+    return std.mem.print(buf, "{d:.1} {s}", .{ v, units[u] }) catch "?";
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -231,11 +231,11 @@ pub fn main(init: std.process.Init) !void {
         try mkdirs(init.io, dir);
         var got: usize = 0;
         for (products) |p| for ([_][]const u8{ "WIN", "MAC" }) |o| for (locales) |l| {
-            const url = try std.fmt.allocPrint(gpa, "{s}?product={s}&locale={s}&os={s}", .{ getlegacy, p, l, o });
+            const url = try gpa.print("{s}?product={s}&locale={s}&os={s}", .{ getlegacy, p, l, o });
             const body = fetchUrl(gpa, &client, url, null) catch continue;
             if (body.len < 1024) continue; // an empty reply is the rate limiter, not a 404
             const ext: []const u8 = if (std.mem.eql(u8, o, "MAC")) "zip" else "exe";
-            const name = try std.fmt.allocPrint(gpa, "{s}_{s}_{s}.{s}", .{ p, l, o, ext });
+            const name = try gpa.print("{s}_{s}_{s}.{s}", .{ p, l, o, ext });
             const full = try zpath(gpa, &.{ dir, name });
             const f = createFile(init.io, full) catch continue;
             defer f.close(init.io);
@@ -380,14 +380,14 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("3  config        none (no --ini)\n", .{});
         }
         if (cookie_name) |n| if (cookie_data) |d| {
-            cookie = try std.fmt.allocPrint(gpa, "{s}={s}", .{ n, d });
+            cookie = try gpa.print("{s}={s}", .{ n, d });
             std.debug.print("     cookie {s} will be sent with every piece\n", .{n});
         };
 
         // The client asks a hardcoded host for a server-side config before it transfers
         // anything, and simply waits out the timeout when that host is gone.
         if (server_config) |host| {
-            const url = try std.fmt.allocPrint(gpa, "{s}/update/Downloader.ini", .{
+            const url = try gpa.print("{s}/update/Downloader.ini", .{
                 std.mem.trimEnd(u8, host, "/"),
             });
             std.debug.print("4  server config {s}\n", .{url});
